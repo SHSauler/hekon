@@ -119,6 +119,8 @@ void escapefilename(char *escape_list, char **filename_ptr)
     }
     strcpy(*filename_ptr, tmp);
   }
+
+  free(tmp);
 }
 
 dev_t getdevice(char *filename) {
@@ -480,6 +482,7 @@ md5_byte_t *getcrcsignatureuntil(char *filename, off_t fsize, off_t max_read)
   file = fopen(filename, "rb");
   if (file == NULL) {
     errormsg("error opening file %s\n", filename);
+    free(digest);
     return NULL;
   }
 
@@ -494,6 +497,7 @@ md5_byte_t *getcrcsignatureuntil(char *filename, off_t fsize, off_t max_read)
     if (fread(chunk, toread, 1, file) != 1) {
       errormsg("error reading from file %s\n", filename);
       fclose(file);
+      free(digest);
       return NULL;
     }
     md5_append(&state, chunk, toread);
