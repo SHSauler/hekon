@@ -24,6 +24,19 @@
 /* stat supports nanosecond precision (Linux) */
 #define HAVE_NSEC_TIMES 1
 
+/* Nanosecond fields are named differently per platform: st_ctim on
+   Linux, st_ctimespec on Apple. Use these, not the raw field names. */
+#if defined(__APPLE__)
+#define STAT_CTIME_NSEC(st) ((st).st_ctimespec.tv_nsec)
+#define STAT_MTIME_NSEC(st) ((st).st_mtimespec.tv_nsec)
+#elif defined(HAVE_NSEC_TIMES)
+#define STAT_CTIME_NSEC(st) ((st).st_ctim.tv_nsec)
+#define STAT_MTIME_NSEC(st) ((st).st_mtim.tv_nsec)
+#else
+#define STAT_CTIME_NSEC(st) 0L
+#define STAT_MTIME_NSEC(st) 0L
+#endif
+
 /* thread pool sizing (Phase B): auto = online CPUs capped here */
 #define AUTO_JOBS_MAX 8
 

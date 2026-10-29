@@ -39,10 +39,8 @@ int removeifnotchanged(const file_t *file, char **errorstring)
       file->inode != st.st_ino ||
       file->ctime != st.st_ctime ||
       file->mtime != st.st_mtime ||
-#ifdef HAVE_NSEC_TIMES
-      file->ctime_nsec != st.st_ctim.tv_nsec ||
-      file->mtime_nsec != st.st_mtim.tv_nsec ||
-#endif
+      file->ctime_nsec != STAT_CTIME_NSEC(st) ||
+      file->mtime_nsec != STAT_MTIME_NSEC(st) ||
       file->size != st.st_size)
   {
     if (errorstring != 0)
