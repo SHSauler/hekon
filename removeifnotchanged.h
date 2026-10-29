@@ -22,7 +22,7 @@
 #ifndef REMOVEIFNOTCHANGED_H
 #define REMOVEIFNOTCHANGED_H
 
-#include "fdupes.h"
+#include "file.h"
 
 int removeifnotchanged(const file_t *file, char **errorstring);
 

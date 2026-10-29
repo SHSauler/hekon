@@ -1,0 +1,70 @@
+.TH HEKON 1 "October 2026" "hekon 1.0.0" "User Commands"
+.SH NAME
+hekon \- delete SOURCE files duplicated in a master TARGET directory
+.SH SYNOPSIS
+.B hekon
+[\fIoptions\fR]
+\fISOURCE TARGET\fR
+.SH DESCRIPTION
+.B hekon
+("she who works her will") finds files in
+.I SOURCE
+that duplicate files in
+.I TARGET
+(the master, never modified) and deletes them.
+Without options it only lists what
+.I would
+be deleted and deletes nothing.
+.PP
+If identical files exist only within
+.I SOURCE
+(no copy in
+.IR TARGET ),
+one copy is kept and the rest are treated as duplicates.
+Duplicate sets existing only within
+.I TARGET
+are ignored.
+.PP
+Content matching reuses the
+.BR fdupes (1)
+pipeline: file size, then partial and full MD5 signatures, then a
+byte-for-byte confirmation before any file is listed or deleted.
+.PP
+Both directories are always recursed into. Symbolic links are not
+followed; only regular files are considered. Hardlinks (same inode)
+are never treated as duplicates.
+.SH OPTIONS
+.TP
+.BR \-d ", " \-\-delete
+Actually delete the SOURCE duplicates. Without this option,
+.B hekon
+is a dry run.
+.TP
+.BR \-q ", " \-\-quiet
+Hide the progress indicator.
+.TP
+.BR \-v ", " \-\-version
+Display version.
+.TP
+.BR \-h ", " \-\-help
+Display help.
+.SH EXAMPLES
+.PP
+Preview what would be removed from a download folder:
+.RS
+hekon ~/downloads ~/photos
+.RE
+.PP
+Actually clean it:
+.RS
+hekon \-d ~/downloads ~/photos
+.RE
+.SH EXIT STATUS
+.TP
+0
+Success.
+.TP
+1
+Error (bad arguments, unreadable directory, overlapping SOURCE/TARGET).
+.SH SEE ALSO
+.BR fdupes (1)

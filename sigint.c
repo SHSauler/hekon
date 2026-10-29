@@ -23,6 +23,7 @@ volatile sig_atomic_t got_sigint = 0;
 
 void sigint_handler(int signal)
 {
+  (void)signal;
   got_sigint = 1;
 }
 

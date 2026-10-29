@@ -19,7 +19,7 @@
    TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
    SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
 
-#include "config.h"
+#include "hekon.h"
 #include "sigint.h"
 #include "confirmmatch.h"
 #include <stdlib.h>
