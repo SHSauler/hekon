@@ -39,6 +39,8 @@ printf 'bbb' > "$SRC/same2"
 printf 'deep-content' > "$TGT/sub/deep"
 cp "$TGT/sub/deep" "$SRC/sub/deep-copy"
 ln -s "$TGT/keep.jpg" "$SRC/link-to-master"
+# hardlink in SOURCE pointing at a TARGET file (must be ignored, never a dupe)
+ln "$TGT/keep.jpg" "$SRC/hard-to-master"
 
 TGT_BEFORE="$(find "$TGT" -type f | sort | xargs md5sum)"
 
@@ -51,6 +53,7 @@ echo "$OUT" | grep -q "would be deleted" || fail "dry-run summary line"
 [ -L "$SRC/link-to-master" ] || fail "dry-run removed symlink"
 # symlink target must not appear as a duplicate entry of its own
 echo "$OUT" | grep -q "link-to-master" && fail "symlink followed as duplicate"
+echo "$OUT" | grep -q "hard-to-master" && fail "hardlink followed as duplicate"
 TGT_AFTER="$(find "$TGT" -type f | sort | xargs md5sum)"
 [ "$TGT_BEFORE" = "$TGT_AFTER" ] || fail "dry-run modified TARGET"
 pass "dry-run lists candidates and deletes nothing"
@@ -75,6 +78,7 @@ SURVIVE=0
 [ -f "$SRC/unique.txt" ] || fail "unique source file deleted"
 [ -f "$SRC/same1" ] && [ -f "$SRC/same2" ] || fail "same-size files touched"
 [ -L "$SRC/link-to-master" ] || fail "symlink deleted"
+[ -e "$SRC/hard-to-master" ] || fail "hardlink deleted"
 [ -f "$TGT/keep.jpg" ] && [ -f "$TGT/sub/deep" ] && [ -f "$TGT/empty" ] || fail "TARGET file missing"
 TGT_AFTER2="$(find "$TGT" -type f | sort | xargs md5sum)"
 [ "$TGT_BEFORE" = "$TGT_AFTER2" ] || fail "delete run modified TARGET"
@@ -111,6 +115,15 @@ echo "$STAT_OUT" | grep -q "full_reused_small=[1-9]" || fail "--stats full_reuse
 echo "$STAT_OUT" | grep -q "bytes_saved_small=[1-9]" || fail "--stats bytes_saved_small==0"
 echo "$STAT_OUT" | grep -q "partial_hashes=[1-9]" || fail "--stats partial_hashes==0"
 pass "--stats counters present and single-read reuse observed"
+
+# --- -j equivalence: identical results at any thread count ---
+OUT_DEF_J="$("$HEKON" -q "$SSTAT" "$TSTAT")"
+[ "$("$HEKON" -q -j1 "$SSTAT" "$TSTAT")" = "$OUT_DEF_J" ] || fail "-j1 output differs from default"
+[ "$("$HEKON" -q -j8 "$SSTAT" "$TSTAT")" = "$OUT_DEF_J" ] || fail "-j8 output differs from default"
+"$HEKON" -q --jobs 2 --stats "$SSTAT" "$TSTAT" 2>&1 | grep -q "jobs=2" || fail "jobs=2 not in stats"
+"$HEKON" -q -j0 "$SSTAT" "$TSTAT" >/dev/null 2>&1 && fail "-j0 accepted" || pass "-j values validated"
+"$HEKON" -q -jabc "$SSTAT" "$TSTAT" >/dev/null 2>&1 && fail "-jabc accepted" || true
+pass "identical results at -j1/-j8/default"
 
 # --- long options work ---
 "$HEKON" --quiet "$SRC" "$TGT" >/dev/null 2>&1 || fail "--quiet long option broken"

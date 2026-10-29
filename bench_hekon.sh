@@ -58,6 +58,10 @@ gen_blob $(( 1024 * 1024 )) 7777 "$SRC/samesize-a.bin"
 gen_blob $(( 1024 * 1024 )) 8888 "$SRC/samesize-b.bin"
 cp "$SRC/samesize-a.bin" "$TGT/samesize-master.bin"  # one of them has a TARGET twin
 
+# uniquely-sized files: never hashed, prove the size-skip path
+gen_blob 12345 4242 "$SRC/odd-src-blob"
+gen_blob 6789 4243 "$TGT/odd-tgt-blob"
+
 # 2. Small files (>4KB partial window, exercises full-hash path)
 i=0
 while [ "$i" -lt "$N_SMALL" ]; do
@@ -104,6 +108,8 @@ while [ "$RUN" -lt 3 ]; do
     [ "${chunk_size:-0}" = "65536" ] || { echo "FAIL: chunk_size=$chunk_size want 65536"; FAIL=1; };
     [ "${full_reused_small:-0}" -gt 0 ] || { echo "FAIL: full_reused_small=0 (tiny-file reuse path dead)"; FAIL=1; };
     [ "${bytes_saved_small:-0}" -gt 0 ] || { echo "FAIL: bytes_saved_small=0"; FAIL=1; };
+    [ "${size_singletons:-0}" -gt 0 ] || { echo "FAIL: size_singletons=0 (size-skip path dead)"; FAIL=1; };
+    [ "${partial_singletons:-0}" -gt 0 ] || { echo "FAIL: partial_singletons=0"; FAIL=1; };
     [ "${partial_hashes:-0}" -gt 0 ] || { echo "FAIL: no partial hashes counted"; FAIL=1; };
   }
 done

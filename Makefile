@@ -2,7 +2,7 @@
 # Plain Makefile, no autoconf. Requires only a C compiler.
 
 CC ?= cc
-CFLAGS ?= -O2 -Wall -Wextra
+CFLAGS ?= -O2 -Wall -Wextra -pthread
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
 MANDIR = $(PREFIX)/share/man/man1

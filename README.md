@@ -7,6 +7,7 @@
 hekon SOURCE TARGET        # dry-run: list what would be deleted, delete nothing
 hekon -d SOURCE TARGET     # actually delete the SOURCE duplicates
 hekon -q SOURCE TARGET     # hide progress indicator
+hekon -j8 SOURCE TARGET    # hash with 8 threads (default: online CPUs, max 8)
 hekon -q --stats SOURCE TARGET  # + machine-parseable counters/timings on stderr
 hekon -h / -v              # help / version
 ```
@@ -24,7 +25,8 @@ Rules:
 * `SOURCE` and `TARGET` must not be the same directory or overlap
   (one inside the other); `hekon` refuses to run in that case.
 * Matching: file size → partial MD5 → full MD5 → byte-for-byte
-  confirmation (same pipeline as fdupes).
+  confirmation (same pipeline as fdupes). Unique-size files are never
+  hashed; hashing runs on a worker pool (`-j/--jobs`).
 
 ## Build / install
 

@@ -24,6 +24,13 @@
 /* stat supports nanosecond precision (Linux) */
 #define HAVE_NSEC_TIMES 1
 
+/* thread pool sizing (Phase B): auto = online CPUs capped here */
+#define AUTO_JOBS_MAX 8
+
+/* explicit -j/--jobs bounds */
+#define JOBS_MIN 1
+#define JOBS_MAX 64
+
 /* getopt_long lives in getopt.h on glibc/musl/macOS; enable long options
    by default. Builds on exotic platforms can compile with -UHAVE_GETOPT_H. */
 #ifndef HAVE_GETOPT_H

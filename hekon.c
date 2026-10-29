@@ -51,6 +51,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <locale.h>
+#include <pthread.h>
 
 #include "hekon.h"
 #ifdef HAVE_GETOPT_H
@@ -68,6 +69,7 @@ char *program_name;
 static int opt_delete = 0;
 static int opt_quiet = 0;
 static int opt_stats = 0;
+static int opt_jobs = 0; /* 0 = auto (online CPUs, capped) */
 
 /* Measurable counters for Phase A (and later phases). All increments for
    hashing happen on the paths that actually read file bytes, so
@@ -81,10 +83,26 @@ static struct {
   long long bytes_full;
   long long bytes_saved_small;
   long long confirms;
+  long long size_singletons;    /* Phase B: files skipped, unique size */
+  long long partial_singletons; /* Phase B: files skipped, unique partial */
+  int jobs_used;                /* Phase B: worker threads in the pool */
   uint64_t scan_ms;
   uint64_t match_ms;
   uint64_t total_ms;
 } g_stats;
+
+static int num_threads(void)
+{
+  long n;
+  if (opt_jobs > 0)
+    return opt_jobs;
+  n = sysconf(_SC_NPROCESSORS_ONLN);
+  if (n < 1)
+    n = 1;
+  if (n > AUTO_JOBS_MAX)
+    n = AUTO_JOBS_MAX;
+  return (int)n;
+}
 
 typedef struct {
   file_t file;        /* must remain the first member so file_t* casts are valid */
@@ -92,12 +110,6 @@ typedef struct {
 } mfile_t;
 
 #define MFILE(f) ((mfile_t*)(void*)(f))
-
-typedef struct _filetree {
-  file_t *file;
-  struct _filetree *left;
-  struct _filetree *right;
-} filetree_t;
 
 #define MD5_DIGEST_LENGTH 16
 
@@ -242,12 +254,20 @@ md5_byte_t *getcrcsignatureuntil(char *filename, off_t fsize, off_t max_read)
   off_t toread;
   md5_state_t state;
   md5_byte_t *digest;
-  static md5_byte_t chunk[CHUNK_SIZE];
+  md5_byte_t *chunk; /* per-call buffer: the old static buffer was not
+                        thread-safe once hashing moved to a worker pool */
   FILE *file;
 
   digest = (md5_byte_t*) malloc(MD5_DIGEST_LENGTH * sizeof(md5_byte_t));
   if (digest == NULL) {
     errormsg("out of memory\n");
+    exit(1);
+  }
+
+  chunk = (md5_byte_t*) malloc(CHUNK_SIZE);
+  if (chunk == NULL) {
+    errormsg("out of memory\n");
+    free(digest);
     exit(1);
   }
 
@@ -259,6 +279,7 @@ md5_byte_t *getcrcsignatureuntil(char *filename, off_t fsize, off_t max_read)
   file = fopen(filename, "rb");
   if (file == NULL) {
     errormsg("error opening file %s\n", filename);
+    free(chunk);
     free(digest);
     return NULL;
   }
@@ -277,6 +298,7 @@ md5_byte_t *getcrcsignatureuntil(char *filename, off_t fsize, off_t max_read)
   while (fsize > 0) {
     if (got_sigint) {
       fclose(file);
+      free(chunk);
       printf("\n");
       exit(0);
     }
@@ -285,6 +307,7 @@ md5_byte_t *getcrcsignatureuntil(char *filename, off_t fsize, off_t max_read)
     if (fread(chunk, toread, 1, file) != 1) {
       errormsg("error reading from file %s\n", filename);
       fclose(file);
+      free(chunk);
       free(digest);
       return NULL;
     }
@@ -294,28 +317,32 @@ md5_byte_t *getcrcsignatureuntil(char *filename, off_t fsize, off_t max_read)
 
   md5_finish(&state, digest);
   fclose(file);
+  free(chunk);
   return digest;
 }
 
-md5_byte_t *getcrcsignature(char *filename, off_t fsize)
+/* Hash one file without touching g_stats (workers accumulate into the
+   pool struct instead; the main thread folds the totals in after join).
+   Returns 1 on success, 0 when the file could not be read (digests stay
+   NULL and the caller skips the file, as the old tree walk did). */
+static int hash_one(file_t *file, int use_full, long long *bytes_used)
 {
-  md5_byte_t *d = getcrcsignatureuntil(filename, fsize, 0);
-  if (d != NULL) {
-    g_stats.full_hashes++;
-    g_stats.bytes_full += (long long)fsize;
+  md5_byte_t *d;
+  if (use_full) {
+    d = getcrcsignatureuntil(file->d_name, file->size, 0);
+    if (d == NULL)
+      return 0;
+    file->crcsignature = d;
+    *bytes_used = (long long)file->size;
+  } else {
+    d = getcrcsignatureuntil(file->d_name, file->size, PARTIAL_MD5_SIZE);
+    if (d == NULL)
+      return 0;
+    file->crcpartial = d;
+    *bytes_used = file->size < PARTIAL_MD5_SIZE ?
+      (long long)file->size : (long long)PARTIAL_MD5_SIZE;
   }
-  return d;
-}
-
-md5_byte_t *getcrcpartialsignature(char *filename, off_t fsize)
-{
-  md5_byte_t *d = getcrcsignatureuntil(filename, fsize, PARTIAL_MD5_SIZE);
-  if (d != NULL) {
-    off_t used = fsize < PARTIAL_MD5_SIZE ? fsize : PARTIAL_MD5_SIZE;
-    g_stats.partial_hashes++;
-    g_stats.bytes_partial += (long long)used;
-  }
-  return d;
+  return 1;
 }
 
 /* Small-file fast path (Phase A.3): files with size <= PARTIAL_MD5_SIZE
@@ -348,49 +375,399 @@ int md5cmp(const md5_byte_t *a, const md5_byte_t *b)
   return 0;
 }
 
-/* ---------------------------------------------------------------- tree */
+/* --------------------------------------------- two-phase parallel matching */
 
-void purgetree(filetree_t *checktree)
+int confirmpair(file_t *a, file_t *b); /* defined below; keep deletion
+                                          logic single-threaded */
+
+typedef struct {
+  file_t *f;
+  int idx; /* position in pre-sort (TARGET-first) order: keeps every sort
+              stable so output is deterministic at any -j */
+} ord_t;
+
+static int cmp_size(const void *a, const void *b)
 {
-  if (checktree == NULL)
-    return;
-  if (checktree->left != NULL) purgetree(checktree->left);
-  if (checktree->right != NULL) purgetree(checktree->right);
-  free(checktree);
+  const ord_t *x = (const ord_t*)a;
+  const ord_t *y = (const ord_t*)b;
+  if (x->f->size < y->f->size)
+    return -1;
+  if (x->f->size > y->f->size)
+    return 1;
+  if (x->idx < y->idx)
+    return -1;
+  if (x->idx > y->idx)
+    return 1;
+  return 0;
 }
 
-int registerfile(filetree_t **branch, file_t *file)
+static int cmp_partial(const void *a, const void *b)
 {
-  *branch = (filetree_t*) malloc(sizeof(filetree_t));
-  if (*branch == NULL) {
-    errormsg("out of memory!\n");
+  const ord_t *x = (const ord_t*)a;
+  const ord_t *y = (const ord_t*)b;
+  int r;
+  if (x->f->size < y->f->size)
+    return -1;
+  if (x->f->size > y->f->size)
+    return 1;
+  r = md5cmp(x->f->crcpartial, y->f->crcpartial);
+  if (r != 0)
+    return r;
+  if (x->idx < y->idx)
+    return -1;
+  if (x->idx > y->idx)
+    return 1;
+  return 0;
+}
+
+static int cmp_full(const void *a, const void *b)
+{
+  const ord_t *x = (const ord_t*)a;
+  const ord_t *y = (const ord_t*)b;
+  int r;
+  if (x->f->size < y->f->size)
+    return -1;
+  if (x->f->size > y->f->size)
+    return 1;
+  r = md5cmp(x->f->crcsignature, y->f->crcsignature);
+  if (r != 0)
+    return r;
+  if (x->idx < y->idx)
+    return -1;
+  if (x->idx > y->idx)
+    return 1;
+  return 0;
+}
+
+typedef struct {
+  ord_t *items; /* files to hash */
+  int n;
+  int next;     /* next index to claim (under lock) */
+  int use_full; /* 0 = partial stage, 1 = full stage */
+  long long hashes;
+  long long bytes;
+  pthread_mutex_t lock;
+} hashwork_t;
+
+static void *hash_worker(void *arg)
+{
+  hashwork_t *w = (hashwork_t*)arg;
+  for (;;) {
+    file_t *f;
+    long long used = 0;
+    int ok;
+
+    pthread_mutex_lock(&w->lock);
+    if (w->next >= w->n) {
+      pthread_mutex_unlock(&w->lock);
+      break;
+    }
+    f = w->items[w->next++].f;
+    pthread_mutex_unlock(&w->lock);
+
+    if (got_sigint)
+      break;
+
+    ok = hash_one(f, w->use_full, &used);
+    if (!ok)
+      continue; /* unreadable: digests stay NULL, main thread skips it */
+
+    pthread_mutex_lock(&w->lock);
+    w->hashes++;
+    w->bytes += used;
+    pthread_mutex_unlock(&w->lock);
+  }
+  return NULL;
+}
+
+/* Hash a stage with the worker pool (main thread polls progress so the
+   indicator keeps moving through the slow part of the run). Falls back
+   to inline hashing if no thread starts, so a -j run still completes. */
+static void run_hash_pool(ord_t *items, int n, int use_full, const char *label)
+{
+  hashwork_t w;
+  pthread_t *tids = NULL;
+  int nthreads = num_threads();
+  int started = 0;
+  int i;
+
+  if (n <= 0)
+    return;
+  if (nthreads > n)
+    nthreads = n;
+
+  w.items = items;
+  w.n = n;
+  w.next = 0;
+  w.use_full = use_full;
+  w.hashes = 0;
+  w.bytes = 0;
+  pthread_mutex_init(&w.lock, NULL);
+
+  tids = (pthread_t*) malloc((size_t)nthreads * sizeof(pthread_t));
+  if (tids == NULL) {
+    errormsg("out of memory\n");
     exit(1);
   }
-  (*branch)->file = file;
-  (*branch)->left = NULL;
-  (*branch)->right = NULL;
-  return 1;
-}
 
-int is_hardlink(filetree_t *checktree, file_t *file)
-{
-  file_t *dupe;
-
-  if ((file->inode == checktree->file->inode) &&
-      (file->device == checktree->file->device))
-    return 1;
-
-  if (checktree->file->hasdupes) {
-    dupe = checktree->file->duplicates;
-    do {
-      if ((file->inode == dupe->inode) &&
-          (file->device == dupe->device))
-        return 1;
-      dupe = dupe->duplicates;
-    } while (dupe != NULL);
+  for (i = 0; i < nthreads; i++) {
+    if (pthread_create(&tids[i], NULL, hash_worker, &w) != 0)
+      break;
+    started++;
   }
 
+  if (started == 0) {
+    long long used = 0;
+    for (i = 0; i < n; i++) {
+      if (got_sigint)
+        break;
+      if (hash_one(items[i].f, use_full, &used)) {
+        w.hashes++;
+        w.bytes += used;
+      }
+    }
+  } else {
+    if (!opt_quiet) {
+      for (;;) {
+        int done;
+        pthread_mutex_lock(&w.lock);
+        done = w.next;
+        pthread_mutex_unlock(&w.lock);
+        if (done >= n || got_sigint)
+          break;
+        fprintf(stderr, "\r%s [%d/%d] ", label, done, n);
+        usleep(100000);
+      }
+      fprintf(stderr, "\r%-40s\r", " ");
+    }
+    for (i = 0; i < started; i++)
+      pthread_join(tids[i], NULL);
+  }
+
+  if (use_full) {
+    g_stats.full_hashes += w.hashes;
+    g_stats.bytes_full += w.bytes;
+  } else {
+    g_stats.partial_hashes += w.hashes;
+    g_stats.bytes_partial += w.bytes;
+  }
+
+  pthread_mutex_destroy(&w.lock);
+  free(tids);
+}
+
+/* true when f shares a device+inode with the head or any chain member */
+static int chain_has_hardlink(file_t *head, file_t *f)
+{
+  file_t *d;
+  if (head->inode == f->inode && head->device == f->device)
+    return 1;
+  for (d = head->duplicates; d != NULL; d = d->duplicates) {
+    if (d->inode == f->inode && d->device == f->device)
+      return 1;
+  }
   return 0;
+}
+
+/* A set containing a TARGET file must be headed by one (stable sort
+   guarantees it; enforce it anyway so the invariant holds by
+   construction, not by luck). Only the flag moves: membership is the
+   same, so deletion candidates are unchanged. */
+static void promote_target_head(file_t *head)
+{
+  file_t *prev;
+  file_t *d;
+  if (MFILE(head)->is_master)
+    return;
+  prev = head;
+  d = head->duplicates;
+  while (d != NULL) {
+    if (MFILE(d)->is_master) {
+      prev->duplicates = d->duplicates;
+      d->duplicates = head;
+      head->hasdupes = 0;
+      d->hasdupes = 1;
+      return;
+    }
+    prev = d;
+    d = d->duplicates;
+  }
+}
+
+/* Chain one confirmed content group (members in TARGET-first list order).
+   Same prepend order the old tree walk produced, so dry-run output is
+   identical at any -j. MD5 collisions (hashes equal, bytes differ) just
+   start a new chain, like the old descend-left path. */
+static void confirm_group(ord_t *g, int n)
+{
+  file_t **heads;
+  int nh = 0;
+  int i;
+  int h;
+
+  heads = (file_t**) malloc((size_t)n * sizeof(file_t*));
+  if (heads == NULL) {
+    errormsg("out of memory\n");
+    exit(1);
+  }
+
+  for (i = 0; i < n; i++) {
+    file_t *f = g[i].f;
+    file_t *hit = NULL;
+    int skip = 0;
+    if (got_sigint) {
+      free(heads);
+      printf("\n");
+      exit(0);
+    }
+    for (h = 0; h < nh; h++) {
+      if (chain_has_hardlink(heads[h], f)) {
+        skip = 1; /* same file by another name: never a duplicate */
+        break;
+      }
+      if (confirmpair(heads[h], f)) {
+        hit = heads[h];
+        break;
+      }
+    }
+    if (skip)
+      continue;
+    if (hit != NULL) {
+      hit->hasdupes = 1;
+      f->duplicates = hit->duplicates;
+      hit->duplicates = f;
+    } else {
+      heads[nh++] = f;
+    }
+  }
+
+  for (h = 0; h < nh; h++)
+    promote_target_head(heads[h]);
+
+  free(heads);
+}
+
+/* Two phases: (1) stable sort by size, uniques can never be duplicates;
+   (2) hash each size-group with the worker pool (partial, then full only
+   within matching partial-groups); the main thread does the byte-for-byte
+   confirmation, so deletion logic stays single-threaded and safe. */
+static void find_duplicates(file_t *files, int filecount)
+{
+  ord_t *ord;
+  ord_t *stage;
+  ord_t *todo;
+  ord_t *full;
+  int n = 0;
+  int ncand;
+  int ntodo;
+  int nfull;
+  int i;
+  file_t *f;
+
+  if (files == NULL || filecount <= 0)
+    return;
+
+  g_stats.jobs_used = num_threads();
+
+  ord = (ord_t*) malloc((size_t)filecount * sizeof(ord_t));
+  stage = (ord_t*) malloc((size_t)filecount * sizeof(ord_t));
+  todo = (ord_t*) malloc((size_t)filecount * sizeof(ord_t));
+  full = (ord_t*) malloc((size_t)filecount * sizeof(ord_t));
+  if (ord == NULL || stage == NULL || todo == NULL || full == NULL) {
+    errormsg("out of memory\n");
+    exit(1);
+  }
+
+  for (f = files; f != NULL; f = f->next) {
+    ord[n].f = f;
+    ord[n].idx = n;
+    n++;
+  }
+
+  qsort(ord, (size_t)n, sizeof(ord_t), cmp_size);
+
+  /* non-unique size groups are the only hashing candidates */
+  ncand = 0;
+  i = 0;
+  while (i < n) {
+    int j = i + 1;
+    int k;
+    while (j < n && ord[j].f->size == ord[i].f->size)
+      j++;
+    if (j - i == 1) {
+      g_stats.size_singletons++;
+    } else {
+      for (k = i; k < j; k++)
+        stage[ncand++] = ord[k];
+    }
+    i = j;
+  }
+
+  run_hash_pool(stage, ncand, 0, "Hashing");
+
+  /* regroup by (size, partial): unreadable files drop out, unique
+     partials need no full hash */
+  {
+    int np = 0;
+    int k;
+    for (k = 0; k < ncand; k++) {
+      if (stage[k].f->crcpartial == NULL)
+        continue;
+      stage[np++] = stage[k];
+    }
+    qsort(stage, (size_t)np, sizeof(ord_t), cmp_partial);
+
+    ntodo = 0;
+    nfull = 0;
+    i = 0;
+    while (i < np) {
+      int j = i + 1;
+      while (j < np && stage[j].f->size == stage[i].f->size &&
+             md5cmp(stage[j].f->crcpartial, stage[i].f->crcpartial) == 0)
+        j++;
+      if (j - i == 1) {
+        g_stats.partial_singletons++;
+      } else {
+        int k2;
+        for (k2 = i; k2 < j; k2++) {
+          if (reuse_partial_as_full(stage[k2].f))
+            full[nfull++] = stage[k2]; /* small file: digest copied, still confirm */
+          else
+            todo[ntodo++] = stage[k2];
+        }
+      }
+      i = j;
+    }
+  }
+
+  run_hash_pool(todo, ntodo, 1, "Hashing");
+
+  /* regroup by (size, full): unreadable files drop out, the rest confirm */
+  {
+    int k;
+    for (k = 0; k < ntodo; k++) {
+      if (todo[k].f->crcsignature == NULL)
+        continue;
+      full[nfull++] = todo[k];
+    }
+    qsort(full, (size_t)nfull, sizeof(ord_t), cmp_full);
+
+    i = 0;
+    while (i < nfull) {
+      int j = i + 1;
+      while (j < nfull && full[j].f->size == full[i].f->size &&
+             md5cmp(full[j].f->crcsignature, full[i].f->crcsignature) == 0)
+        j++;
+      if (j - i > 1)
+        confirm_group(full + i, j - i);
+      i = j;
+    }
+  }
+
+  free(ord);
+  free(stage);
+  free(todo);
+  free(full);
 }
 
 /* byte-for-byte confirmation of two files by path */
@@ -415,90 +792,6 @@ int confirmpair(file_t *a, file_t *b)
   fclose(f1);
   fclose(f2);
   return r;
-}
-
-/* Compare a candidate file against the tree. Returns &checktree->file (pointer
-   to the chain-head pointer) when a confirmed duplicate is found, NULL when
-   the file has been registered into the tree as unique.
-
-   Pipeline: size -> partial md5 -> full md5 -> byte-for-byte confirmation.
-   On the practically-impossible md5 collision (hashes equal but bytes differ),
-   we descend the tree (treated as less-than) so each true content group still
-   ends up correctly grouped. */
-file_t **checkmatch(filetree_t *checktree, file_t *file)
-{
-  int cmpresult;
-  int confirmed;
-
-  if (is_hardlink(checktree, file))
-    return NULL;
-
-  if (file->size < checktree->file->size)
-    cmpresult = -1;
-  else if (file->size > checktree->file->size)
-    cmpresult = 1;
-  else {
-    if (checktree->file->crcpartial == NULL) {
-      checktree->file->crcpartial = getcrcpartialsignature(checktree->file->d_name, checktree->file->size);
-      if (checktree->file->crcpartial == NULL) {
-        errormsg("cannot read file %s\n", checktree->file->d_name);
-        return NULL;
-      }
-    }
-
-    if (file->crcpartial == NULL) {
-      file->crcpartial = getcrcpartialsignature(file->d_name, file->size);
-      if (file->crcpartial == NULL) {
-        errormsg("cannot read file %s\n", file->d_name);
-        return NULL;
-      }
-    }
-
-    cmpresult = md5cmp(file->crcpartial, checktree->file->crcpartial);
-
-    if (cmpresult == 0) {
-      if (checktree->file->crcsignature == NULL) {
-        if (!reuse_partial_as_full(checktree->file)) {
-          checktree->file->crcsignature = getcrcsignature(checktree->file->d_name, checktree->file->size);
-          if (checktree->file->crcsignature == NULL)
-            return NULL;
-        }
-      }
-      if (file->crcsignature == NULL) {
-        if (!reuse_partial_as_full(file)) {
-          file->crcsignature = getcrcsignature(file->d_name, file->size);
-          if (file->crcsignature == NULL)
-            return NULL;
-        }
-      }
-
-      cmpresult = md5cmp(file->crcsignature, checktree->file->crcsignature);
-    }
-  }
-
-  if (cmpresult < 0) {
-    if (checktree->left != NULL)
-      return checkmatch(checktree->left, file);
-    registerfile(&(checktree->left), file);
-    return NULL;
-  } else if (cmpresult > 0) {
-    if (checktree->right != NULL)
-      return checkmatch(checktree->right, file);
-    registerfile(&(checktree->right), file);
-    return NULL;
-  } else {
-    /* hashes match: confirm byte-for-byte before declaring a duplicate */
-    confirmed = confirmpair(checktree->file, file);
-    if (!confirmed) {
-      /* hash collision with different content: descend left and retry so the
-         file can still be matched against its true content twin if present. */
-      if (checktree->left != NULL)
-        return checkmatch(checktree->left, file);
-      registerfile(&(checktree->left), file);
-      return NULL;
-    }
-    return &checktree->file;
-  }
 }
 
 /* ---------------------------------------------------------------- formatting */
@@ -530,21 +823,24 @@ int countsets(file_t *files)
   return n;
 }
 
-/* Machine-parseable counters on stderr (KEY=VALUE per line, plus a human
-   line). Every value is exact, not sampled, so bench runs can assert on
-   them: e.g. full_reused_small == number of <=4KB files that reached the
-   full-hash stage, bytes_saved_small == bytes not re-read. */
+/* Machine-parseable counters on stderr. Every value is exact, not sampled,
+   so bench runs can assert on them: e.g. full_reused_small == number of
+   <=4KB files that reached the full-hash stage, size_singletons == files
+   that never needed hashing at all. */
 void print_stats(int filecount)
 {
   fprintf(stderr, "stats: files=%d partial_hashes=%lld full_hashes=%lld "
     "full_reused_small=%lld bytes_partial=%lld bytes_full=%lld "
     "bytes_saved_small=%lld confirms=%lld "
+    "size_singletons=%lld partial_singletons=%lld jobs=%d "
     "scan_ms=%llu match_ms=%llu total_ms=%llu chunk_size=%d partial_size=%d\n",
     filecount,
     g_stats.partial_hashes, g_stats.full_hashes,
     g_stats.full_reused_small,
     g_stats.bytes_partial, g_stats.bytes_full,
     g_stats.bytes_saved_small, g_stats.confirms,
+    g_stats.size_singletons, g_stats.partial_singletons,
+    g_stats.jobs_used,
     (unsigned long long)g_stats.scan_ms,
     (unsigned long long)g_stats.match_ms,
     (unsigned long long)g_stats.total_ms,
@@ -708,6 +1004,7 @@ void help_text(void)
     "one copy is kept and the rest are treated as duplicates.\n\n"
     "  -d --delete   actually delete the SOURCE duplicates\n"
     "  -q --quiet    hide progress indicator\n"
+    "  -j --jobs N   hash with N threads (default: online CPUs, max 8)\n"
     "  --stats       print machine-parseable counters/timings to stderr\n"
     "  -v --version  display version\n"
     "  -h --help     display this help message\n\n"
@@ -722,12 +1019,7 @@ int main(int argc, char **argv)
   int opt;
   file_t *files = NULL;
   file_t *curfile;
-  file_t **match = NULL;
-  filetree_t *checktree = NULL;
   int filecount = 0;
-  int progress = 0;
-  uint64_t last_progress = 0;
-  uint64_t now = 0;
   char *sourcedir;
   char *targetdir;
   struct stat sourcestat;
@@ -740,6 +1032,7 @@ int main(int argc, char **argv)
     { "delete",  0, 0, 'd' },
     { "quiet",   0, 0, 'q' },
     { "stats",   0, 0, 1000 },
+    { "jobs",    1, 0, 'j' },
     { "version", 0, 0, 'v' },
     { "help",    0, 0, 'h' },
     { 0, 0, 0, 0 }
@@ -768,7 +1061,7 @@ int main(int argc, char **argv)
     }
   }
 
-  while ((opt = GETOPT(argc, argv, "dqvh"
+  while ((opt = GETOPT(argc, argv, "dqvhj:"
 #ifdef HAVE_GETOPT_H
           , long_options, NULL
 #endif
@@ -783,6 +1076,17 @@ int main(int argc, char **argv)
     case 1000:
       opt_stats = 1;
       break;
+    case 'j': {
+      char *end = NULL;
+      long v = strtol(optarg, &end, 10);
+      if (end == optarg || *end != '\0' || v < JOBS_MIN) {
+        errormsg("invalid --jobs value '%s' (want %d..%d)\n",
+          optarg, JOBS_MIN, JOBS_MAX);
+        exit(1);
+      }
+      opt_jobs = v > JOBS_MAX ? JOBS_MAX : (int)v;
+      break;
+    }
     case 'v':
       printf("hekon %s\n", HEKON_VERSION);
       exit(0);
@@ -858,39 +1162,10 @@ int main(int argc, char **argv)
   if (!opt_quiet)
     fprintf(stderr, "\r%-40s\r", " ");
 
-  /* match: build duplicate chains */
+  /* match: group by size, hash groups with the pool, confirm inline */
   {
     uint64_t t_match_start = now64();
-  curfile = files;
-  while (curfile) {
-    if (got_sigint) {
-      printf("\n");
-      exit(0);
-    }
-
-    if (!checktree)
-      registerfile(&checktree, curfile);
-    else {
-      match = checkmatch(checktree, curfile);
-      if (match != NULL) {
-        (*match)->hasdupes = 1;
-        curfile->duplicates = (*match)->duplicates;
-        (*match)->duplicates = curfile;
-      }
-    }
-
-    curfile = curfile->next;
-
-    if (!opt_quiet) {
-      now = now64();
-      if (now - last_progress > FDUPES_PROGRESS_REFRESH_MS) {
-        last_progress = now;
-        fprintf(stderr, "\rComparing [%d/%d] %d%% ", progress, filecount,
-          filecount ? (int)((float)progress / (float)filecount * 100.0) : 100);
-      }
-      progress++;
-    }
-  }
+    find_duplicates(files, filecount);
     g_stats.match_ms = now64() - t_match_start;
   }
 
@@ -917,7 +1192,6 @@ int main(int argc, char **argv)
     free(files);
     files = curfile;
   }
-  purgetree(checktree);
   }
 
   return 0;
