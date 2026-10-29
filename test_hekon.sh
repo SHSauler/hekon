@@ -125,6 +125,29 @@ OUT_DEF_J="$("$HEKON" -q "$SSTAT" "$TSTAT")"
 "$HEKON" -q -jabc "$SSTAT" "$TSTAT" >/dev/null 2>&1 && fail "-jabc accepted" || true
 pass "identical results at -j1/-j8/default"
 
+# --- --cache: second run on an unchanged tree skips hashing ---
+export XDG_CACHE_HOME="$ROOT/xdg-cache"
+"$HEKON" -q --cache --stats "$SSTAT" "$TSTAT" >/dev/null 2>&1  # populate
+CACHE2="$("$HEKON" -q --cache --stats "$SSTAT" "$TSTAT" 2>&1)"
+echo "$CACHE2" | grep -q "cache_hits_partial=[1-9]" || fail "warm cache run has no hits"
+echo "$CACHE2" | grep -q "partial_hashes=0" || fail "warm cache run still hashed partials"
+echo "$CACHE2" | grep -q "full_hashes=0" || fail "warm cache run still hashed fulls"
+# staleness: any mtime change invalidates the entry
+touch "$SSTAT/a.jpg"
+CACHE3="$("$HEKON" -q --cache --stats "$SSTAT" "$TSTAT" 2>&1)"
+echo "$CACHE3" | grep -q "partial_hashes=[1-9]" || fail "mtime change did not invalidate entry"
+# --cache-clear deletes the cache; next run hashes everything again
+"$HEKON" --cache-clear >/dev/null 2>&1
+[ ! -f "$ROOT/xdg-cache/hekon/hashes" ] || fail "cache file survives --cache-clear"
+CACHE4="$("$HEKON" -q --cache --stats "$SSTAT" "$TSTAT" 2>&1)"
+echo "$CACHE4" | grep -q "cache_hits_partial=0" || fail "hits served after clear"
+pass "cache skips rehashing, invalidates on mtime, clears on demand"
+# plain runs never touch the cache
+"$HEKON" --cache-clear >/dev/null 2>&1
+"$HEKON" -q "$SSTAT" "$TSTAT" >/dev/null 2>&1
+[ ! -f "$ROOT/xdg-cache/hekon/hashes" ] || fail "plain run created cache"
+pass "plain runs stay cache-free"
+
 # --- long options work ---
 "$HEKON" --quiet "$SRC" "$TGT" >/dev/null 2>&1 || fail "--quiet long option broken"
 pass "long options accepted"

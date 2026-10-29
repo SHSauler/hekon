@@ -70,6 +70,8 @@ static int opt_delete = 0;
 static int opt_quiet = 0;
 static int opt_stats = 0;
 static int opt_jobs = 0; /* 0 = auto (online CPUs, capped) */
+static int opt_cache = 0;
+static int opt_cache_clear = 0;
 
 /* Measurable counters for Phase A (and later phases). All increments for
    hashing happen on the paths that actually read file bytes, so
@@ -85,6 +87,8 @@ static struct {
   long long confirms;
   long long size_singletons;    /* Phase B: files skipped, unique size */
   long long partial_singletons; /* Phase B: files skipped, unique partial */
+  long long cache_hits_partial; /* Phase C: partial digests served from cache */
+  long long cache_hits_full;    /* Phase C: full digests served from cache */
   int jobs_used;                /* Phase B: worker threads in the pool */
   uint64_t scan_ms;
   uint64_t match_ms;
@@ -373,6 +377,392 @@ int md5cmp(const md5_byte_t *a, const md5_byte_t *b)
       return 1;
   }
   return 0;
+}
+
+/* ------------------------------------------------------- persistent hash cache
+   Phase C, Option 1: flat file, no dependencies. Records are keyed by
+   (device, inode, size, mtime, mtime_nsec, ctime, ctime_nsec) so any
+   change invalidates the entry; the stored path is not trusted.
+   Entries carry a hash-alg tag so a future algorithm swap (Phase D)
+   ignores stale records instead of misreading them.
+   Pruning is lazy: save rewrites only entries still referenced by a
+   file seen during the scan, so vanished files fall out on their own. */
+
+#define CACHE_MAGIC "HEKONC1"
+#define CACHE_MAGIC_LEN 8 /* includes trailing NUL */
+#define CACHE_VERSION 1u
+#define CACHE_ALG_MD5 1u
+#define CACHE_BUCKETS 4096
+#define CACHE_FILENAME "hashes"
+
+typedef struct {
+  uint64_t dev;
+  uint64_t ino;
+  int64_t size;
+  int64_t mtime;
+  int64_t mtime_nsec;
+  int64_t ctime;
+  int64_t ctime_nsec;
+} cachekey_t;
+
+typedef struct cacheent {
+  cachekey_t key;
+  unsigned char alg;
+  int has_partial;
+  int has_full;
+  int live; /* referenced this run: only live entries are saved */
+  md5_byte_t partial[MD5_DIGEST_LENGTH];
+  md5_byte_t full[MD5_DIGEST_LENGTH];
+  struct cacheent *next;
+} cacheent_t;
+
+static cacheent_t *cache_tab[CACHE_BUCKETS];
+static int cache_have = 0; /* table populated from disk */
+static int cache_dirty = 0; /* new entries since load: worth saving */
+static char *cache_path = NULL;
+
+static void cache_keyof(file_t *f, cachekey_t *k)
+{
+  k->dev = (uint64_t)f->device;
+  k->ino = (uint64_t)f->inode;
+  k->size = (int64_t)f->size;
+  k->mtime = (int64_t)f->mtime;
+  k->mtime_nsec = (int64_t)f->mtime_nsec;
+  k->ctime = (int64_t)f->ctime;
+  k->ctime_nsec = (int64_t)f->ctime_nsec;
+}
+
+static int cache_keyeq(const cachekey_t *a, const cachekey_t *b)
+{
+  return a->dev == b->dev && a->ino == b->ino &&
+    a->size == b->size && a->mtime == b->mtime &&
+    a->mtime_nsec == b->mtime_nsec && a->ctime == b->ctime &&
+    a->ctime_nsec == b->ctime_nsec;
+}
+
+static unsigned cache_hash(const cachekey_t *k)
+{
+  uint64_t h = k->dev ^ (k->dev >> 33) ^ k->ino ^ (k->ino >> 33);
+  return (unsigned)(h % CACHE_BUCKETS);
+}
+
+static cacheent_t *cache_find(const cachekey_t *k)
+{
+  cacheent_t *e = cache_tab[cache_hash(k)];
+  while (e != NULL) {
+    if (cache_keyeq(&e->key, k))
+      return e;
+    e = e->next;
+  }
+  return NULL;
+}
+
+/* path for this user; creates $dir/hekon on demand. NULL when no home. */
+static char *cache_default_path(void)
+{
+  const char *xdg = getenv("XDG_CACHE_HOME");
+  const char *home = getenv("HOME");
+  const char *base;
+  char *dir;
+  char *path;
+  size_t need;
+
+  base = (xdg != NULL && *xdg != '\0') ? xdg : NULL;
+  if (base == NULL) {
+    static char fb[PATH_MAX];
+    if (home == NULL || *home == '\0')
+      return NULL;
+    if (snprintf(fb, sizeof fb, "%s/.cache", home) >= (int)sizeof fb)
+      return NULL;
+    base = fb;
+  }
+
+  need = strlen(base) + strlen("/hekon") + 1;
+  dir = (char*) malloc(need);
+  if (dir == NULL) {
+    errormsg("out of memory\n");
+    exit(1);
+  }
+  snprintf(dir, need, "%s/hekon", base);
+  mkdir(base, 0700); /* best-effort; fopen below reports real failures */
+  mkdir(dir, 0700);
+
+  need = strlen(dir) + 1 + strlen(CACHE_FILENAME) + 1;
+  path = (char*) malloc(need);
+  if (path == NULL) {
+    errormsg("out of memory\n");
+    exit(1);
+  }
+  snprintf(path, need, "%s/%s", dir, CACHE_FILENAME);
+  free(dir);
+  return path;
+}
+
+static int cache_rd32(FILE *f, uint32_t *v)
+{
+  unsigned char b[4];
+  if (fread(b, 1, 4, f) != 4)
+    return 0;
+  *v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+    ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+  return 1;
+}
+
+static int cache_rd64(FILE *f, uint64_t *v)
+{
+  unsigned char b[8];
+  int i;
+  uint64_t r = 0;
+  if (fread(b, 1, 8, f) != 8)
+    return 0;
+  for (i = 7; i >= 0; i--)
+    r = (r << 8) | b[i];
+  return (*v = r), 1;
+}
+
+static void cache_wr32(FILE *f, uint32_t v)
+{
+  unsigned char b[4];
+  b[0] = v & 0xff;
+  b[1] = (v >> 8) & 0xff;
+  b[2] = (v >> 16) & 0xff;
+  b[3] = (v >> 24) & 0xff;
+  fwrite(b, 1, 4, f);
+}
+
+static void cache_wr64(FILE *f, uint64_t v)
+{
+  unsigned char b[8];
+  int i;
+  for (i = 0; i < 8; i++)
+    b[i] = (v >> (8 * i)) & 0xff;
+  fwrite(b, 1, 8, f);
+}
+
+static int cache_rdkey(FILE *f, cachekey_t *k)
+{
+  uint64_t u[7];
+  int i;
+  for (i = 0; i < 7; i++) {
+    if (!cache_rd64(f, &u[i]))
+      return 0;
+  }
+  k->dev = u[0];
+  k->ino = u[1];
+  k->size = (int64_t)u[2];
+  k->mtime = (int64_t)u[3];
+  k->mtime_nsec = (int64_t)u[4];
+  k->ctime = (int64_t)u[5];
+  k->ctime_nsec = (int64_t)u[6];
+  return 1;
+}
+
+static void cache_load(void)
+{
+  FILE *f;
+  char magic[CACHE_MAGIC_LEN];
+  uint32_t ver;
+
+  if (cache_have)
+    return;
+  cache_have = 1;
+
+  cache_path = cache_default_path();
+  if (cache_path == NULL)
+    return; /* no home: run uncached */
+
+  f = fopen(cache_path, "rb");
+  if (f == NULL)
+    return; /* cold start: nothing cached yet */
+
+  if (fread(magic, 1, CACHE_MAGIC_LEN, f) != CACHE_MAGIC_LEN ||
+      memcmp(magic, CACHE_MAGIC, CACHE_MAGIC_LEN) != 0 ||
+      !cache_rd32(f, &ver) || ver != CACHE_VERSION) {
+    fclose(f); /* foreign or future file: start fresh, overwrite on save */
+    cache_dirty = 1;
+    return;
+  }
+
+  for (;;) {
+    cachekey_t k;
+    unsigned char hdr[4];
+    unsigned bucket;
+    cacheent_t *e;
+    if (!cache_rdkey(f, &k))
+      break; /* clean EOF or truncated tail: stop */
+    if (fread(hdr, 1, 4, f) != 4)
+      break;
+    e = (cacheent_t*) malloc(sizeof(cacheent_t));
+    if (e == NULL) {
+      errormsg("out of memory\n");
+      exit(1);
+    }
+    e->key = k;
+    e->alg = hdr[0];
+    e->has_partial = hdr[1] ? 1 : 0;
+    e->has_full = hdr[2] ? 1 : 0;
+    e->live = 0;
+    if (fread(e->partial, 1, MD5_DIGEST_LENGTH, f) != MD5_DIGEST_LENGTH ||
+        fread(e->full, 1, MD5_DIGEST_LENGTH, f) != MD5_DIGEST_LENGTH) {
+      free(e);
+      break; /* truncated tail: ignore it */
+    }
+    if (e->alg != CACHE_ALG_MD5 || (!e->has_partial && !e->has_full)) {
+      free(e);
+      continue; /* unknown-alg entries are never trusted */
+    }
+    /* newest record wins: file is append-mostly, so prepend here */
+    bucket = cache_hash(&k);
+    e->next = cache_tab[bucket];
+    cache_tab[bucket] = e;
+  }
+  fclose(f);
+}
+
+/* keep a loaded entry alive when its file is still on disk (see above) */
+static void cache_touch(file_t *f)
+{
+  cachekey_t k;
+  cacheent_t *e;
+  cache_keyof(f, &k);
+  e = cache_find(&k);
+  if (e != NULL)
+    e->live = 1;
+}
+
+/* partial digest from cache; 1 on hit (digest installed), 0 on miss */
+static int cache_fetch_partial(file_t *f)
+{
+  cachekey_t k;
+  cacheent_t *e;
+  cache_keyof(f, &k);
+  e = cache_find(&k);
+  if (e == NULL || !e->has_partial)
+    return 0;
+  f->crcpartial = (md5_byte_t*) malloc(MD5_DIGEST_LENGTH);
+  if (f->crcpartial == NULL) {
+    errormsg("out of memory\n");
+    exit(1);
+  }
+  memcpy(f->crcpartial, e->partial, MD5_DIGEST_LENGTH);
+  e->live = 1;
+  g_stats.cache_hits_partial++;
+  return 1;
+}
+
+/* full digest from cache; 1 on hit, 0 on miss */
+static int cache_fetch_full(file_t *f)
+{
+  cachekey_t k;
+  cacheent_t *e;
+  cache_keyof(f, &k);
+  e = cache_find(&k);
+  if (e == NULL || !e->has_full)
+    return 0;
+  f->crcsignature = (md5_byte_t*) malloc(MD5_DIGEST_LENGTH);
+  if (f->crcsignature == NULL) {
+    errormsg("out of memory\n");
+    exit(1);
+  }
+  memcpy(f->crcsignature, e->full, MD5_DIGEST_LENGTH);
+  e->live = 1;
+  g_stats.cache_hits_full++;
+  return 1;
+}
+
+static void cache_store(file_t *f, int is_full)
+{
+  cachekey_t k;
+  cacheent_t *e;
+  cache_keyof(f, &k);
+  e = cache_find(&k);
+  if (e == NULL) {
+    e = (cacheent_t*) malloc(sizeof(cacheent_t));
+    if (e == NULL) {
+      errormsg("out of memory\n");
+      exit(1);
+    }
+    e->key = k;
+    e->alg = CACHE_ALG_MD5;
+    e->has_partial = 0;
+    e->has_full = 0;
+    e->next = cache_tab[cache_hash(&k)];
+    cache_tab[cache_hash(&k)] = e;
+  }
+  if (is_full) {
+    if (f->crcsignature == NULL)
+      return;
+    memcpy(e->full, f->crcsignature, MD5_DIGEST_LENGTH);
+    e->has_full = 1;
+  } else {
+    if (f->crcpartial == NULL)
+      return;
+    memcpy(e->partial, f->crcpartial, MD5_DIGEST_LENGTH);
+    e->has_partial = 1;
+  }
+  e->live = 1;
+  cache_dirty = 1;
+}
+
+/* atomic replace (tmp + rename); skips when nothing new was learned */
+static void cache_save(void)
+{
+  FILE *f;
+  char *tmp;
+  size_t need;
+  int b;
+
+  if (!cache_dirty || cache_path == NULL)
+    return;
+
+  need = strlen(cache_path) + 16;
+  tmp = (char*) malloc(need);
+  if (tmp == NULL) {
+    errormsg("out of memory\n");
+    exit(1);
+  }
+  snprintf(tmp, need, "%s.tmp.%d", cache_path, (int)getpid());
+  f = fopen(tmp, "wb");
+  if (f == NULL) {
+    errormsg("cannot write cache %s\n", tmp);
+    free(tmp);
+    return;
+  }
+
+  fwrite(CACHE_MAGIC, 1, CACHE_MAGIC_LEN, f);
+  cache_wr32(f, CACHE_VERSION);
+  for (b = 0; b < CACHE_BUCKETS; b++) {
+    cacheent_t *e = cache_tab[b];
+    while (e != NULL) {
+      if (e->live) {
+        unsigned char hdr[4];
+        cache_wr64(f, e->key.dev);
+        cache_wr64(f, e->key.ino);
+        cache_wr64(f, (uint64_t)e->key.size);
+        cache_wr64(f, (uint64_t)e->key.mtime);
+        cache_wr64(f, (uint64_t)e->key.mtime_nsec);
+        cache_wr64(f, (uint64_t)e->key.ctime);
+        cache_wr64(f, (uint64_t)e->key.ctime_nsec);
+        hdr[0] = e->alg;
+        hdr[1] = (unsigned char)e->has_partial;
+        hdr[2] = (unsigned char)e->has_full;
+        hdr[3] = 0;
+        fwrite(hdr, 1, 4, f);
+        fwrite(e->partial, 1, MD5_DIGEST_LENGTH, f);
+        fwrite(e->full, 1, MD5_DIGEST_LENGTH, f);
+      }
+      e = e->next;
+    }
+  }
+  if (fclose(f) != 0) {
+    errormsg("cannot write cache %s\n", tmp);
+    free(tmp);
+    return;
+  }
+  if (rename(tmp, cache_path) != 0)
+    errormsg("cannot write cache %s\n", cache_path);
+  free(tmp);
+  cache_dirty = 0;
 }
 
 /* --------------------------------------------- two-phase parallel matching */
@@ -703,7 +1093,32 @@ static void find_duplicates(file_t *files, int filecount)
     i = j;
   }
 
-  run_hash_pool(stage, ncand, 0, "Hashing");
+  if (opt_cache) {
+    /* cache first: hits skip the pool entirely (single-threaded, no I/O) */
+    ntodo = 0;
+    {
+      int k;
+      for (k = 0; k < ncand; k++) {
+        if (cache_fetch_partial(stage[k].f))
+          continue;
+        todo[ntodo++] = stage[k];
+      }
+    }
+    run_hash_pool(todo, ntodo, 0, "Hashing");
+    {
+      int k;
+      for (k = 0; k < ntodo; k++) {
+        if (todo[k].f->crcpartial != NULL)
+          cache_store(todo[k].f, 0);
+      }
+    }
+  } else {
+    run_hash_pool(stage, ncand, 0, "Hashing");
+  }
+  if (got_sigint) {
+    printf("\n");
+    exit(0);
+  }
 
   /* regroup by (size, partial): unreadable files drop out, unique
      partials need no full hash */
@@ -730,10 +1145,15 @@ static void find_duplicates(file_t *files, int filecount)
       } else {
         int k2;
         for (k2 = i; k2 < j; k2++) {
-          if (reuse_partial_as_full(stage[k2].f))
+          if (reuse_partial_as_full(stage[k2].f)) {
             full[nfull++] = stage[k2]; /* small file: digest copied, still confirm */
-          else
+            if (opt_cache)
+              cache_store(stage[k2].f, 1);
+          } else if (opt_cache && cache_fetch_full(stage[k2].f)) {
+            full[nfull++] = stage[k2]; /* full digest served from cache */
+          } else {
             todo[ntodo++] = stage[k2];
+          }
         }
       }
       i = j;
@@ -741,6 +1161,17 @@ static void find_duplicates(file_t *files, int filecount)
   }
 
   run_hash_pool(todo, ntodo, 1, "Hashing");
+  if (got_sigint) {
+    printf("\n");
+    exit(0);
+  }
+  if (opt_cache) {
+    int k;
+    for (k = 0; k < ntodo; k++) {
+      if (todo[k].f->crcsignature != NULL)
+        cache_store(todo[k].f, 1);
+    }
+  }
 
   /* regroup by (size, full): unreadable files drop out, the rest confirm */
   {
@@ -833,6 +1264,7 @@ void print_stats(int filecount)
     "full_reused_small=%lld bytes_partial=%lld bytes_full=%lld "
     "bytes_saved_small=%lld confirms=%lld "
     "size_singletons=%lld partial_singletons=%lld jobs=%d "
+    "cache_hits_partial=%lld cache_hits_full=%lld "
     "scan_ms=%llu match_ms=%llu total_ms=%llu chunk_size=%d partial_size=%d\n",
     filecount,
     g_stats.partial_hashes, g_stats.full_hashes,
@@ -841,6 +1273,7 @@ void print_stats(int filecount)
     g_stats.bytes_saved_small, g_stats.confirms,
     g_stats.size_singletons, g_stats.partial_singletons,
     g_stats.jobs_used,
+    g_stats.cache_hits_partial, g_stats.cache_hits_full,
     (unsigned long long)g_stats.scan_ms,
     (unsigned long long)g_stats.match_ms,
     (unsigned long long)g_stats.total_ms,
@@ -1005,6 +1438,8 @@ void help_text(void)
     "  -d --delete   actually delete the SOURCE duplicates\n"
     "  -q --quiet    hide progress indicator\n"
     "  -j --jobs N   hash with N threads (default: online CPUs, max 8)\n"
+    "  --cache       reuse hashes across runs (flat file under $XDG_CACHE_HOME/hekon/)\n"
+    "  --cache-clear delete the hash cache and exit\n"
     "  --stats       print machine-parseable counters/timings to stderr\n"
     "  -v --version  display version\n"
     "  -h --help     display this help message\n\n"
@@ -1033,6 +1468,8 @@ int main(int argc, char **argv)
     { "quiet",   0, 0, 'q' },
     { "stats",   0, 0, 1000 },
     { "jobs",    1, 0, 'j' },
+    { "cache",   0, 0, 1001 },
+    { "cache-clear", 0, 0, 1002 },
     { "version", 0, 0, 'v' },
     { "help",    0, 0, 'h' },
     { 0, 0, 0, 0 }
@@ -1045,14 +1482,25 @@ int main(int argc, char **argv)
   program_name = argv[0];
   setlocale(LC_CTYPE, "");
 
-  /* --stats must also work when built without getopt_long (HAVE_GETOPT_H
-     unset): pre-scan argv and strip it so plain getopt never sees it. */
+  /* --stats/--cache/--cache-clear must also work when built without
+     getopt_long (HAVE_GETOPT_H unset): pre-scan argv and strip them so
+     plain getopt never sees them. */
   {
     int ai;
     for (ai = 1; ai < argc; ai++) {
+      int aj;
+      int strip = 0;
       if (strcmp(argv[ai], "--stats") == 0) {
-        int aj;
         opt_stats = 1;
+        strip = 1;
+      } else if (strcmp(argv[ai], "--cache") == 0) {
+        opt_cache = 1;
+        strip = 1;
+      } else if (strcmp(argv[ai], "--cache-clear") == 0) {
+        opt_cache_clear = 1;
+        strip = 1;
+      }
+      if (strip) {
         for (aj = ai; aj < argc - 1; aj++)
           argv[aj] = argv[aj + 1];
         argc--;
@@ -1076,6 +1524,12 @@ int main(int argc, char **argv)
     case 1000:
       opt_stats = 1;
       break;
+    case 1001:
+      opt_cache = 1;
+      break;
+    case 1002:
+      opt_cache_clear = 1;
+      break;
     case 'j': {
       char *end = NULL;
       long v = strtol(optarg, &end, 10);
@@ -1097,6 +1551,20 @@ int main(int argc, char **argv)
       help_text();
       exit(1);
     }
+  }
+
+  if (opt_cache_clear) {
+    char *p = cache_default_path();
+    if (p == NULL) {
+      printf("No cache to clear (no home directory).\n");
+      exit(0);
+    }
+    if (unlink(p) == 0)
+      printf("Cache cleared (%s).\n", p);
+    else
+      printf("No cache to clear (%s).\n", p);
+    free(p);
+    exit(0);
   }
 
   if (optind + 2 != argc) {
@@ -1159,6 +1627,15 @@ int main(int argc, char **argv)
   filecount += scan_directory(targetdir, &files, 1);
   g_stats.scan_ms = now64() - t_scan_start;
 
+  if (opt_cache) {
+    file_t *tf;
+    cache_load();
+    /* keep entries for files still on disk alive, so only vanished
+       files fall out of the cache on save */
+    for (tf = files; tf != NULL; tf = tf->next)
+      cache_touch(tf);
+  }
+
   if (!opt_quiet)
     fprintf(stderr, "\r%-40s\r", " ");
 
@@ -1168,6 +1645,9 @@ int main(int argc, char **argv)
     find_duplicates(files, filecount);
     g_stats.match_ms = now64() - t_match_start;
   }
+
+  if (opt_cache)
+    cache_save();
 
   if (!opt_quiet)
     fprintf(stderr, "\r%-40s\r", " ");

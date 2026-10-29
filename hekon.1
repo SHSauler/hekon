@@ -46,6 +46,18 @@ Hide the progress indicator.
 .BR \-j ", " \-\-jobs " N"
 Hash with N worker threads (1..64, default: online CPUs, max 8).
 .TP
+.B \-\-cache
+Reuse file hashes across runs. Digests are keyed by device, inode,
+size, mtime and ctime in a flat file under
+.I $XDG_CACHE_HOME/hekon/
+(or
+.IR ~/.cache/hekon/ );
+any change to those invalidates the entry. The byte-for-byte
+confirmation still runs every time.
+.TP
+.B \-\-cache-clear
+Delete the hash cache file and exit.
+.TP
 .B \-\-stats
 Print a machine-parseable
 .B stats:

@@ -53,6 +53,24 @@ partial digest instead of re-read. `bench_hekon.sh` asserts these are
 non-zero on its fixture, so `make bench` fails if the optimization
 regresses.
 
+## Hash cache (`--cache`)
+
+Repeat runs on an unchanged tree skip hashing: digests are keyed by
+`(device, inode, size, mtime, ctime)` and stored in one flat file at
+`$XDG_CACHE_HOME/hekon/hashes` (or `~/.cache/hekon/hashes`). Any
+metadata change invalidates the entry; files that vanished fall out on
+the next save. The byte-for-byte confirmation still runs every time, so
+a stale hit can never cause a wrong delete.
+
+```
+hekon --cache -q SRC TGT          # first run populates, later runs reuse
+hekon --cache --stats -q SRC TGT  # warm run: partial_hashes=0 full_hashes=0,
+                                  # cache_hits_partial/full > 0
+hekon --cache-clear               # delete the cache file and exit
+```
+
+`--cache` is off by default; plain runs never read or write the cache.
+
 ## Example
 
 ```
