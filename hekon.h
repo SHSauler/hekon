@@ -50,6 +50,6 @@
 #define HAVE_GETOPT_H 1
 #endif
 
-#define HEKON_VERSION "1.0.0"
+#define HEKON_VERSION "1.1.0"
 
 #endif /* HEKON_H */
