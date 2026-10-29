@@ -142,7 +142,10 @@ void getfilestats(file_t *file, struct stat *info)
   file->device = info->st_dev;
   file->ctime = info->st_ctime;
   file->mtime = info->st_mtime;
-#ifdef HAVE_NSEC_TIMES
+#if defined(__APPLE__)
+  file->ctime_nsec = info->st_ctimespec.tv_nsec;
+  file->mtime_nsec = info->st_mtimespec.tv_nsec;
+#elif defined(HAVE_NSEC_TIMES)
   file->ctime_nsec = info->st_ctim.tv_nsec;
   file->mtime_nsec = info->st_mtim.tv_nsec;
 #else
