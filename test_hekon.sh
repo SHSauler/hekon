@@ -159,6 +159,22 @@ pass "cache skips rehashing, invalidates on mtime, clears on demand"
 [ ! -f "$ROOT/xdg-cache/hekon/hashes" ] || fail "plain run created cache"
 pass "plain runs stay cache-free"
 
+# --- source-only sets keep the shortest name ---
+SH="$ROOT/short-src"; THT="$ROOT/short-tgt"
+mkdir -p "$SH" "$THT"
+printf 'same-bytes-here' > "$SH/a.txt"
+cp "$SH/a.txt" "$SH/medium-name.txt"
+cp "$SH/a.txt" "$SH/a-much-longer-filename.txt"
+cp "$SH/a.txt" "$SH/0dbcfe1d97a65810b35252889f4d55b33f01d3ef-601x401 (2).avif"
+cp "$SH/a.txt" "$SH/test.avif"
+SHOUT="$("$HEKON" -q "$SH" "$THT")"
+echo "$SHOUT" | grep -Fq "[KEEP] $SH/a.txt" || fail "shortest name not kept"
+echo "$SHOUT" | grep -Fq "[DELETE] $SH/test.avif" || fail "longer copy not listed for delete"
+"$HEKON" -q -d "$SH" "$THT" >/dev/null 2>&1
+[ -f "$SH/a.txt" ] || fail "shortest copy deleted"
+[ ! -e "$SH/test.avif" ] && [ ! -e "$SH/medium-name.txt" ] && [ ! -e "$SH/a-much-longer-filename.txt" ] || fail "longer copies survive"
+pass "source-only sets keep the shortest name"
+
 # --- staging hash: same 4KB prefix but different tails must not match ---
 BIGT="$ROOT/bigt"; BIGS="$ROOT/bigs"
 mkdir -p "$BIGT" "$BIGS"

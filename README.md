@@ -27,7 +27,7 @@ Rules:
   empty files included).
 * Hardlinks (same device+inode) are never treated as duplicates.
 * Identical files existing only in `SOURCE` are deduplicated too:
-  one copy is kept, the rest deleted.
+  the shortest-named copy is kept, the rest deleted.
 * `SOURCE` and `TARGET` must not be the same directory or overlap
   (one inside the other); `hekon` refuses to run in that case.
 * Matching: file size → partial XXH3 → full XXH3 → byte-for-byte

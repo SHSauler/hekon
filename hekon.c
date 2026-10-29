@@ -965,10 +965,19 @@ static int chain_has_hardlink(file_t *head, file_t *f)
   return 0;
 }
 
+/* Move d (preceded by prev) to the head of its chain. Only the flag
+   moves: membership is the same, so deletion candidates are unchanged. */
+static void rotate_to_head(file_t *head, file_t *prev, file_t *d)
+{
+  prev->duplicates = d->duplicates;
+  d->duplicates = head;
+  head->hasdupes = 0;
+  d->hasdupes = 1;
+}
+
 /* A set containing a TARGET file must be headed by one (stable sort
    guarantees it; enforce it anyway so the invariant holds by
-   construction, not by luck). Only the flag moves: membership is the
-   same, so deletion candidates are unchanged. */
+   construction, not by luck). */
 static void promote_target_head(file_t *head)
 {
   file_t *prev;
@@ -979,15 +988,52 @@ static void promote_target_head(file_t *head)
   d = head->duplicates;
   while (d != NULL) {
     if (MFILE(d)->is_master) {
-      prev->duplicates = d->duplicates;
-      d->duplicates = head;
-      head->hasdupes = 0;
-      d->hasdupes = 1;
+      rotate_to_head(head, prev, d);
       return;
     }
     prev = d;
     d = d->duplicates;
   }
+}
+
+static const char *base_name(const char *path)
+{
+  const char *b = strrchr(path, '/');
+  return b != NULL ? b + 1 : path;
+}
+
+/* Source-only sets: keep the shortest-named copy, delete the rest.
+   TARGET-headed sets are untouched (master always wins). Ties keep
+   list order, so the choice is deterministic at any -j. */
+static void prefer_shortest_head(file_t *head)
+{
+  file_t *prev = head;
+  file_t *d = head->duplicates;
+  file_t *best = head;
+  file_t *best_prev = NULL;
+  size_t best_len;
+  file_t *m;
+
+  if (MFILE(head)->is_master)
+    return;
+  for (m = head->duplicates; m != NULL; m = m->duplicates) {
+    if (MFILE(m)->is_master)
+      return; /* promotion owns that case */
+  }
+
+  best_len = strlen(base_name(head->d_name));
+  while (d != NULL) {
+    size_t l = strlen(base_name(d->d_name));
+    if (l < best_len) {
+      best_len = l;
+      best = d;
+      best_prev = prev;
+    }
+    prev = d;
+    d = d->duplicates;
+  }
+  if (best != head)
+    rotate_to_head(head, best_prev, best);
 }
 
 /* Chain one confirmed content group (members in TARGET-first list order).
@@ -1037,8 +1083,10 @@ static void confirm_group(ord_t *g, int n)
     }
   }
 
-  for (h = 0; h < nh; h++)
+  for (h = 0; h < nh; h++) {
     promote_target_head(heads[h]);
+    prefer_shortest_head(heads[h]);
+  }
 
   free(heads);
 }
