@@ -7,20 +7,18 @@ PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
 MANDIR = $(PREFIX)/share/man/man1
 
-OBJS = hekon.o confirmmatch.o errormsg.o sigint.o removeifnotchanged.o md5/md5.o
+OBJS = hekon.o confirmmatch.o errormsg.o sigint.o removeifnotchanged.o
 
 all: hekon
 
 hekon: $(OBJS)
 	$(CC) $(CFLAGS) -o hekon $(OBJS)
 
-hekon.o: hekon.c hekon.h file.h confirmmatch.h errormsg.h sigint.h removeifnotchanged.h
+hekon.o: hekon.c hekon.h file.h confirmmatch.h errormsg.h sigint.h removeifnotchanged.h xxhash.h
 confirmmatch.o: confirmmatch.c confirmmatch.h hekon.h sigint.h
 errormsg.o: errormsg.c errormsg.h hekon.h
 sigint.o: sigint.c sigint.h
 removeifnotchanged.o: removeifnotchanged.c removeifnotchanged.h file.h hekon.h
-md5/md5.o: md5/md5.c md5/md5.h
-	$(CC) $(CFLAGS) -c md5/md5.c -o md5/md5.o
 
 install: hekon
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(MANDIR)

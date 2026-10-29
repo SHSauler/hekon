@@ -5,13 +5,13 @@
 #define HEKON_FILE_H
 
 #include <sys/stat.h>
-#include "md5/md5.h"
+#include <stdint.h>
 
 typedef struct _file {
   char *d_name;
   off_t size;
-  md5_byte_t *crcpartial;
-  md5_byte_t *crcsignature;
+  uint8_t *crcpartial;   /* staging digests (XXH3-64); confirmed byte-for-byte */
+  uint8_t *crcsignature; /* before any file is listed or deleted */
   dev_t device;
   ino_t inode;
   time_t mtime;

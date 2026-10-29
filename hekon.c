@@ -6,7 +6,7 @@
 
    Derived from fdupes-master (fdupes family, (c) 1999-2022 Adrian Lopez,
    plus fdupes-master authors 2024). Matching pipeline reused verbatim:
-   file size -> partial MD5 -> full MD5 -> byte-for-byte confirmation.
+   file size -> partial XXH3 -> full XXH3 -> byte-for-byte confirmation.
 
    Rules:
    * TARGET (master) is never modified or deleted.
@@ -115,7 +115,14 @@ typedef struct {
 
 #define MFILE(f) ((mfile_t*)(void*)(f))
 
-#define MD5_DIGEST_LENGTH 16
+/* Staging hashes: XXH3-64 (vendored xxhash.h, XXH_INLINE_ALL — no library
+   or submodule needed). 8-byte digests only ever stage candidates; the
+   final word is always the byte-for-byte confirmpair() comparison. */
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+#define HASH_LEN 8
+#define HASH_ALG_NAME "xxh3"
+#define HASH_ALG_TAG 2 /* cache record tag; MD5 era was 1 */
 
 /* ---------------------------------------------------------------- current time */
 
@@ -251,31 +258,31 @@ int scan_directory(char *dir, file_t **filelistp, int is_master)
   return filecount;
 }
 
-/* ---------------------------------------------------------------- md5 helpers */
+/* ---------------------------------------------------------------- hash helpers */
 
-md5_byte_t *getcrcsignatureuntil(char *filename, off_t fsize, off_t max_read)
+uint8_t *getcrcsignatureuntil(char *filename, off_t fsize, off_t max_read)
 {
   off_t toread;
-  md5_state_t state;
-  md5_byte_t *digest;
-  md5_byte_t *chunk; /* per-call buffer: the old static buffer was not
-                        thread-safe once hashing moved to a worker pool */
+  XXH3_state_t state;
+  uint64_t h;
+  uint8_t *digest;
+  unsigned char *chunk; /* per-call buffer: thread-safe for the worker pool */
   FILE *file;
 
-  digest = (md5_byte_t*) malloc(MD5_DIGEST_LENGTH * sizeof(md5_byte_t));
+  digest = (uint8_t*) malloc(HASH_LEN);
   if (digest == NULL) {
     errormsg("out of memory\n");
     exit(1);
   }
 
-  chunk = (md5_byte_t*) malloc(CHUNK_SIZE);
+  chunk = (unsigned char*) malloc(CHUNK_SIZE);
   if (chunk == NULL) {
     errormsg("out of memory\n");
     free(digest);
     exit(1);
   }
 
-  md5_init(&state);
+  XXH3_64bits_reset(&state);
 
   if (max_read != 0 && fsize > max_read)
     fsize = max_read;
@@ -315,13 +322,18 @@ md5_byte_t *getcrcsignatureuntil(char *filename, off_t fsize, off_t max_read)
       free(digest);
       return NULL;
     }
-    md5_append(&state, chunk, toread);
+    XXH3_64bits_update(&state, chunk, (size_t)toread);
     fsize -= toread;
   }
 
-  md5_finish(&state, digest);
+  h = XXH3_64bits_digest(&state);
   fclose(file);
   free(chunk);
+  {
+    int i;
+    for (i = 0; i < HASH_LEN; i++)
+      digest[i] = (uint8_t)(h >> (8 * i));
+  }
   return digest;
 }
 
@@ -331,7 +343,7 @@ md5_byte_t *getcrcsignatureuntil(char *filename, off_t fsize, off_t max_read)
    NULL and the caller skips the file, as the old tree walk did). */
 static int hash_one(file_t *file, int use_full, long long *bytes_used)
 {
-  md5_byte_t *d;
+  uint8_t *d;
   if (use_full) {
     d = getcrcsignatureuntil(file->d_name, file->size, 0);
     if (d == NULL)
@@ -339,38 +351,38 @@ static int hash_one(file_t *file, int use_full, long long *bytes_used)
     file->crcsignature = d;
     *bytes_used = (long long)file->size;
   } else {
-    d = getcrcsignatureuntil(file->d_name, file->size, PARTIAL_MD5_SIZE);
+    d = getcrcsignatureuntil(file->d_name, file->size, PARTIAL_HASH_SIZE);
     if (d == NULL)
       return 0;
     file->crcpartial = d;
-    *bytes_used = file->size < PARTIAL_MD5_SIZE ?
-      (long long)file->size : (long long)PARTIAL_MD5_SIZE;
+    *bytes_used = file->size < PARTIAL_HASH_SIZE ?
+      (long long)file->size : (long long)PARTIAL_HASH_SIZE;
   }
   return 1;
 }
 
-/* Small-file fast path (Phase A.3): files with size <= PARTIAL_MD5_SIZE
-   are read once. partial == full by definition, so copy the 16-byte
-   digest instead of re-reading the file. Returns 1 when reused. */
+/* Small-file fast path (Phase A.3): files with size <= PARTIAL_HASH_SIZE
+   are read once. partial == full by definition, so copy the digest
+   instead of re-reading the file. Returns 1 when reused. */
 int reuse_partial_as_full(file_t *file)
 {
-  if (file->size > PARTIAL_MD5_SIZE || file->crcpartial == NULL)
+  if (file->size > PARTIAL_HASH_SIZE || file->crcpartial == NULL)
     return 0;
-  file->crcsignature = (md5_byte_t*) malloc(MD5_DIGEST_LENGTH * sizeof(md5_byte_t));
+  file->crcsignature = (uint8_t*) malloc(HASH_LEN);
   if (file->crcsignature == NULL) {
     errormsg("out of memory\n");
     exit(1);
   }
-  memcpy(file->crcsignature, file->crcpartial, MD5_DIGEST_LENGTH);
+  memcpy(file->crcsignature, file->crcpartial, HASH_LEN);
   g_stats.full_reused_small++;
   g_stats.bytes_saved_small += (long long)file->size;
   return 1;
 }
 
-int md5cmp(const md5_byte_t *a, const md5_byte_t *b)
+int hashcmp(const uint8_t *a, const uint8_t *b)
 {
   int x;
-  for (x = 0; x < MD5_DIGEST_LENGTH; ++x) {
+  for (x = 0; x < HASH_LEN; ++x) {
     if (a[x] < b[x])
       return -1;
     else if (a[x] > b[x])
@@ -390,8 +402,7 @@ int md5cmp(const md5_byte_t *a, const md5_byte_t *b)
 
 #define CACHE_MAGIC "HEKONC1"
 #define CACHE_MAGIC_LEN 8 /* includes trailing NUL */
-#define CACHE_VERSION 1u
-#define CACHE_ALG_MD5 1u
+#define CACHE_VERSION 2u /* v1 was the MD5 era: rejected wholesale */
 #define CACHE_BUCKETS 4096
 #define CACHE_FILENAME "hashes"
 
@@ -411,8 +422,8 @@ typedef struct cacheent {
   int has_partial;
   int has_full;
   int live; /* referenced this run: only live entries are saved */
-  md5_byte_t partial[MD5_DIGEST_LENGTH];
-  md5_byte_t full[MD5_DIGEST_LENGTH];
+  uint8_t partial[HASH_LEN];
+  uint8_t full[HASH_LEN];
   struct cacheent *next;
 } cacheent_t;
 
@@ -602,12 +613,12 @@ static void cache_load(void)
     e->has_partial = hdr[1] ? 1 : 0;
     e->has_full = hdr[2] ? 1 : 0;
     e->live = 0;
-    if (fread(e->partial, 1, MD5_DIGEST_LENGTH, f) != MD5_DIGEST_LENGTH ||
-        fread(e->full, 1, MD5_DIGEST_LENGTH, f) != MD5_DIGEST_LENGTH) {
+    if (fread(e->partial, 1, HASH_LEN, f) != HASH_LEN ||
+        fread(e->full, 1, HASH_LEN, f) != HASH_LEN) {
       free(e);
       break; /* truncated tail: ignore it */
     }
-    if (e->alg != CACHE_ALG_MD5 || (!e->has_partial && !e->has_full)) {
+    if (e->alg != HASH_ALG_TAG || (!e->has_partial && !e->has_full)) {
       free(e);
       continue; /* unknown-alg entries are never trusted */
     }
@@ -639,12 +650,12 @@ static int cache_fetch_partial(file_t *f)
   e = cache_find(&k);
   if (e == NULL || !e->has_partial)
     return 0;
-  f->crcpartial = (md5_byte_t*) malloc(MD5_DIGEST_LENGTH);
+  f->crcpartial = (uint8_t*) malloc(HASH_LEN);
   if (f->crcpartial == NULL) {
     errormsg("out of memory\n");
     exit(1);
   }
-  memcpy(f->crcpartial, e->partial, MD5_DIGEST_LENGTH);
+  memcpy(f->crcpartial, e->partial, HASH_LEN);
   e->live = 1;
   g_stats.cache_hits_partial++;
   return 1;
@@ -659,12 +670,12 @@ static int cache_fetch_full(file_t *f)
   e = cache_find(&k);
   if (e == NULL || !e->has_full)
     return 0;
-  f->crcsignature = (md5_byte_t*) malloc(MD5_DIGEST_LENGTH);
+  f->crcsignature = (uint8_t*) malloc(HASH_LEN);
   if (f->crcsignature == NULL) {
     errormsg("out of memory\n");
     exit(1);
   }
-  memcpy(f->crcsignature, e->full, MD5_DIGEST_LENGTH);
+  memcpy(f->crcsignature, e->full, HASH_LEN);
   e->live = 1;
   g_stats.cache_hits_full++;
   return 1;
@@ -683,7 +694,7 @@ static void cache_store(file_t *f, int is_full)
       exit(1);
     }
     e->key = k;
-    e->alg = CACHE_ALG_MD5;
+    e->alg = HASH_ALG_TAG;
     e->has_partial = 0;
     e->has_full = 0;
     e->next = cache_tab[cache_hash(&k)];
@@ -692,12 +703,12 @@ static void cache_store(file_t *f, int is_full)
   if (is_full) {
     if (f->crcsignature == NULL)
       return;
-    memcpy(e->full, f->crcsignature, MD5_DIGEST_LENGTH);
+    memcpy(e->full, f->crcsignature, HASH_LEN);
     e->has_full = 1;
   } else {
     if (f->crcpartial == NULL)
       return;
-    memcpy(e->partial, f->crcpartial, MD5_DIGEST_LENGTH);
+    memcpy(e->partial, f->crcpartial, HASH_LEN);
     e->has_partial = 1;
   }
   e->live = 1;
@@ -748,8 +759,8 @@ static void cache_save(void)
         hdr[2] = (unsigned char)e->has_full;
         hdr[3] = 0;
         fwrite(hdr, 1, 4, f);
-        fwrite(e->partial, 1, MD5_DIGEST_LENGTH, f);
-        fwrite(e->full, 1, MD5_DIGEST_LENGTH, f);
+        fwrite(e->partial, 1, HASH_LEN, f);
+        fwrite(e->full, 1, HASH_LEN, f);
       }
       e = e->next;
     }
@@ -800,7 +811,7 @@ static int cmp_partial(const void *a, const void *b)
     return -1;
   if (x->f->size > y->f->size)
     return 1;
-  r = md5cmp(x->f->crcpartial, y->f->crcpartial);
+  r = hashcmp(x->f->crcpartial, y->f->crcpartial);
   if (r != 0)
     return r;
   if (x->idx < y->idx)
@@ -819,7 +830,7 @@ static int cmp_full(const void *a, const void *b)
     return -1;
   if (x->f->size > y->f->size)
     return 1;
-  r = md5cmp(x->f->crcsignature, y->f->crcsignature);
+  r = hashcmp(x->f->crcsignature, y->f->crcsignature);
   if (r != 0)
     return r;
   if (x->idx < y->idx)
@@ -986,7 +997,7 @@ static void promote_target_head(file_t *head)
 
 /* Chain one confirmed content group (members in TARGET-first list order).
    Same prepend order the old tree walk produced, so dry-run output is
-   identical at any -j. MD5 collisions (hashes equal, bytes differ) just
+   identical at any -j. Hash collisions (digests equal, bytes differ) just
    start a new chain, like the old descend-left path. */
 static void confirm_group(ord_t *g, int n)
 {
@@ -1138,7 +1149,7 @@ static void find_duplicates(file_t *files, int filecount)
     while (i < np) {
       int j = i + 1;
       while (j < np && stage[j].f->size == stage[i].f->size &&
-             md5cmp(stage[j].f->crcpartial, stage[i].f->crcpartial) == 0)
+             hashcmp(stage[j].f->crcpartial, stage[i].f->crcpartial) == 0)
         j++;
       if (j - i == 1) {
         g_stats.partial_singletons++;
@@ -1187,7 +1198,7 @@ static void find_duplicates(file_t *files, int filecount)
     while (i < nfull) {
       int j = i + 1;
       while (j < nfull && full[j].f->size == full[i].f->size &&
-             md5cmp(full[j].f->crcsignature, full[i].f->crcsignature) == 0)
+             hashcmp(full[j].f->crcsignature, full[i].f->crcsignature) == 0)
         j++;
       if (j - i > 1)
         confirm_group(full + i, j - i);
@@ -1264,7 +1275,7 @@ void print_stats(int filecount)
     "full_reused_small=%lld bytes_partial=%lld bytes_full=%lld "
     "bytes_saved_small=%lld confirms=%lld "
     "size_singletons=%lld partial_singletons=%lld jobs=%d "
-    "cache_hits_partial=%lld cache_hits_full=%lld "
+    "cache_hits_partial=%lld cache_hits_full=%lld hash_alg=%s "
     "scan_ms=%llu match_ms=%llu total_ms=%llu chunk_size=%d partial_size=%d\n",
     filecount,
     g_stats.partial_hashes, g_stats.full_hashes,
@@ -1274,10 +1285,11 @@ void print_stats(int filecount)
     g_stats.size_singletons, g_stats.partial_singletons,
     g_stats.jobs_used,
     g_stats.cache_hits_partial, g_stats.cache_hits_full,
+    HASH_ALG_NAME,
     (unsigned long long)g_stats.scan_ms,
     (unsigned long long)g_stats.match_ms,
     (unsigned long long)g_stats.total_ms,
-    CHUNK_SIZE, PARTIAL_MD5_SIZE);
+    CHUNK_SIZE, PARTIAL_HASH_SIZE);
 }
 
 /* A chain member is deletable only if it lives in SOURCE. TARGET members
@@ -1444,7 +1456,7 @@ void help_text(void)
     "  -v --version  display version\n"
     "  -h --help     display this help message\n\n"
     "Both directories are recursed. Symlinks are not followed.\n"
-    "Matching: file size, partial/full MD5, then byte-for-byte confirm.\n");
+    "Matching: file size, partial/full XXH3, then byte-for-byte confirm.\n");
 }
 
 /* ---------------------------------------------------------------- main */

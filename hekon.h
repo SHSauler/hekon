@@ -16,7 +16,7 @@
 #define CHUNK_SIZE 65536
 
 /* max bytes used when calculating partial hashes */
-#define PARTIAL_MD5_SIZE 4096
+#define PARTIAL_HASH_SIZE 4096
 
 /* time interval to refresh progress indicator (milliseconds) */
 #define FDUPES_PROGRESS_REFRESH_MS 100

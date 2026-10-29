@@ -27,7 +27,7 @@ are ignored.
 .PP
 Content matching reuses the
 .BR fdupes (1)
-pipeline: file size, then partial and full MD5 signatures, then a
+pipeline: file size, then partial and full XXH3 digests, then a
 byte-for-byte confirmation before any file is listed or deleted.
 .PP
 Both directories are always recursed into. Symbolic links are not

@@ -24,8 +24,9 @@ Rules:
   one copy is kept, the rest deleted.
 * `SOURCE` and `TARGET` must not be the same directory or overlap
   (one inside the other); `hekon` refuses to run in that case.
-* Matching: file size → partial MD5 → full MD5 → byte-for-byte
-  confirmation (same pipeline as fdupes). Unique-size files are never
+* Matching: file size → partial XXH3 → full XXH3 → byte-for-byte
+  confirmation (same staged pipeline as fdupes, but with xxHash instead
+  of MD5). Unique-size files are never
   hashed; hashing runs on a worker pool (`-j/--jobs`).
 
 ## Build / install
@@ -48,7 +49,7 @@ stats: files=811 partial_hashes=811 full_hashes=350 full_reused_small=360 \
 ```
 
 `full_reused_small` / `bytes_saved_small` measure the small-file
-single-read win directly: files ≤ 4 KB whose full MD5 is copied from the
+single-read win directly: files ≤ 4 KB whose full digest is copied from the
 partial digest instead of re-read. `bench_hekon.sh` asserts these are
 non-zero on its fixture, so `make bench` fails if the optimization
 regresses.
@@ -94,9 +95,10 @@ Deleted 2 files (1.0 MB).
 ## Origin
 
 Fork-and-trim of `fdupes-master` from the fdupes family
-((c) 1999–2022 Adrian Lopez and contributors, MIT). The hashing
-(`md5/`), byte confirmation (`confirmmatch`), safe delete
-(`removeifnotchanged`), signal and error helpers are reused verbatim
-apart from dropping the autoconf `config.h` dependency. Interactive
+((c) 1999–2022 Adrian Lopez and contributors, MIT). Byte confirmation
+(`confirmmatch`), safe delete (`removeifnotchanged`), signal and error
+helpers are reused verbatim apart from dropping the autoconf `config.h`
+dependency; the MD5 staging hashes were replaced with vendored xxHash
+(`xxhash.h`, BSD-2-Clause, (c) Yann Collet). Interactive
 prompts, size/hidden filters, logging, ncurses and sqlite support
 were removed for simplicity.

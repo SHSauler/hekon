@@ -148,6 +148,17 @@ pass "cache skips rehashing, invalidates on mtime, clears on demand"
 [ ! -f "$ROOT/xdg-cache/hekon/hashes" ] || fail "plain run created cache"
 pass "plain runs stay cache-free"
 
+# --- staging hash: same 4KB prefix but different tails must not match ---
+BIGT="$ROOT/bigt"; BIGS="$ROOT/bigs"
+mkdir -p "$BIGT" "$BIGS"
+(head -c 4096 /dev/zero; echo TAIL-A; head -c 100000 /dev/zero) > "$BIGT/p1"
+(head -c 4096 /dev/zero; echo TAIL-B; head -c 100000 /dev/zero) > "$BIGS/p2"
+cp "$BIGT/p1" "$BIGS/p1-copy"
+BIGOUT="$("$HEKON" -q "$BIGS" "$BIGT")"
+echo "$BIGOUT" | grep -q "p1-copy" || fail "identical large file not flagged"
+echo "$BIGOUT" | grep -q "p2" && fail "same-prefix different tail flagged as dupe"
+pass "full-hash staging distinguishes same-prefix files"
+
 # --- long options work ---
 "$HEKON" --quiet "$SRC" "$TGT" >/dev/null 2>&1 || fail "--quiet long option broken"
 pass "long options accepted"
