@@ -937,7 +937,7 @@ static void run_hash_pool(ord_t *items, int n, int use_full, const char *label)
         if (done >= n || got_sigint)
           break;
         fprintf(stderr, "\r%s [%d/%d] ", label, done, n);
-        usleep(100000);
+        { struct timespec ts = { 0, 100000000L }; nanosleep(&ts, NULL); }
       }
       fprintf(stderr, "\r%-40s\r", " ");
     }

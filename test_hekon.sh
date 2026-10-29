@@ -9,6 +9,17 @@ FAIL=0
 pass() { echo "ok: $1"; }
 fail() { echo "FAIL: $1"; FAIL=1; }
 
+# portable per-file checksums (md5sum on Linux, md5 -r on macOS)
+fingerprint() { # $1 = dir
+  if command -v md5sum >/dev/null 2>&1; then
+    find "$1" -type f | sort | xargs md5sum
+  elif command -v md5 >/dev/null 2>&1; then
+    find "$1" -type f | sort | xargs md5 -r
+  else
+    find "$1" -type f | sort | xargs cksum
+  fi
+}
+
 [ -x "$HEKON" ] || { echo "FAIL: $HEKON not built (run make first)"; exit 1; }
 
 ROOT="$(mktemp -d /tmp/hekon-test.XXXXXX)"
@@ -42,7 +53,7 @@ ln -s "$TGT/keep.jpg" "$SRC/link-to-master"
 # hardlink in SOURCE pointing at a TARGET file (must be ignored, never a dupe)
 ln "$TGT/keep.jpg" "$SRC/hard-to-master"
 
-TGT_BEFORE="$(find "$TGT" -type f | sort | xargs md5sum)"
+TGT_BEFORE="$(fingerprint "$TGT")"
 
 # --- dry-run deletes nothing ---
 OUT="$("$HEKON" -q "$SRC" "$TGT")"
@@ -54,7 +65,7 @@ echo "$OUT" | grep -q "would be deleted" || fail "dry-run summary line"
 # symlink target must not appear as a duplicate entry of its own
 echo "$OUT" | grep -q "link-to-master" && fail "symlink followed as duplicate"
 echo "$OUT" | grep -q "hard-to-master" && fail "hardlink followed as duplicate"
-TGT_AFTER="$(find "$TGT" -type f | sort | xargs md5sum)"
+TGT_AFTER="$(fingerprint "$TGT")"
 [ "$TGT_BEFORE" = "$TGT_AFTER" ] || fail "dry-run modified TARGET"
 pass "dry-run lists candidates and deletes nothing"
 
@@ -80,7 +91,7 @@ SURVIVE=0
 [ -L "$SRC/link-to-master" ] || fail "symlink deleted"
 [ -e "$SRC/hard-to-master" ] || fail "hardlink deleted"
 [ -f "$TGT/keep.jpg" ] && [ -f "$TGT/sub/deep" ] && [ -f "$TGT/empty" ] || fail "TARGET file missing"
-TGT_AFTER2="$(find "$TGT" -type f | sort | xargs md5sum)"
+TGT_AFTER2="$(fingerprint "$TGT")"
 [ "$TGT_BEFORE" = "$TGT_AFTER2" ] || fail "delete run modified TARGET"
 grep -q "Deleted" "$ROOT/del.out" || fail "delete run output missing 'Deleted'"
 pass "delete removes SOURCE dupes, keeps TARGET and one source-only copy"
@@ -151,8 +162,8 @@ pass "plain runs stay cache-free"
 # --- staging hash: same 4KB prefix but different tails must not match ---
 BIGT="$ROOT/bigt"; BIGS="$ROOT/bigs"
 mkdir -p "$BIGT" "$BIGS"
-(head -c 4096 /dev/zero; echo TAIL-A; head -c 100000 /dev/zero) > "$BIGT/p1"
-(head -c 4096 /dev/zero; echo TAIL-B; head -c 100000 /dev/zero) > "$BIGS/p2"
+(dd if=/dev/zero bs=4096 count=1 2>/dev/null; echo TAIL-A; dd if=/dev/zero bs=1000 count=100 2>/dev/null) > "$BIGT/p1"
+(dd if=/dev/zero bs=4096 count=1 2>/dev/null; echo TAIL-B; dd if=/dev/zero bs=1000 count=100 2>/dev/null) > "$BIGS/p2"
 cp "$BIGT/p1" "$BIGS/p1-copy"
 BIGOUT="$("$HEKON" -q "$BIGS" "$BIGT")"
 echo "$BIGOUT" | grep -q "p1-copy" || fail "identical large file not flagged"

@@ -1,4 +1,5 @@
 # hekon
+[![CI](https://github.com/SHSauler/hekon/actions/workflows/ci.yml/badge.svg)](https://github.com/SHSauler/hekon/actions/workflows/ci.yml)
 
 `hekon` deletes files in `SOURCE` that duplicate files in `TARGET`
 (the master, never modified). Derived from `fdupes-master`.

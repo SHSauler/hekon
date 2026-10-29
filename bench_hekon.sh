@@ -15,6 +15,15 @@ HEKON="${HEKON:-./hekon}"
 BENCH_MB="${BENCH_MB:-64}"
 BENCH_DIR="${BENCH_DIR:-/tmp/hekon-bench.$$}"
 
+# portable millisecond clock (macOS date has no %N)
+now_ms() {
+  ns="$(date +%s%N 2>/dev/null)"
+  case "$ns" in
+    ''|*[!0-9]*) python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || echo $(( $(date +%s) * 1000 )) ;;
+    *) echo $(( ns / 1000000 )) ;;
+  esac
+}
+
 [ -x "$HEKON" ] || { echo "FAIL: $HEKON not built (run make first)"; exit 1; }
 
 # Scale fixture to requested MB: split budget 70% large / 20% small / 10% tiny.
@@ -86,18 +95,18 @@ while [ "$i" -lt "$N_TINY" ]; do
   i=$(( i + 1 ))
 done
 
-DU_BYTES="$(du -sb "$BENCH_DIR" | cut -f1)"
-echo "fixture_bytes=$DU_BYTES"
+DU_HUMAN="$(du -sh "$BENCH_DIR" | cut -f1)"
+echo "fixture=$DU_HUMAN"
 
 # 3 timed runs, keep the stats line of each.
 RUN=0
 FAIL=0
 while [ "$RUN" -lt 3 ]; do
   RUN=$(( RUN + 1 ))
-  START="$(date +%s%N)"
+  START="$(now_ms)"
   OUT="$("$HEKON" -q --stats "$SRC" "$TGT" 2>"$BENCH_DIR/stats-$RUN.txt")"
-  END="$(date +%s%N)"
-  WALL_MS=$(( (END - START) / 1000000 ))
+  END="$(now_ms)"
+  WALL_MS=$(( END - START ))
   STATS="$(grep '^stats:' "$BENCH_DIR/stats-$RUN.txt" || true)"
   echo "run$RUN wall_ms=$WALL_MS $STATS"
   echo "$OUT" | grep -q "would be deleted" || { echo "FAIL: run$RUN missing summary"; FAIL=1; }

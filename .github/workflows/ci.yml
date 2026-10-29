@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - name: Test
+        run: make test
+      - name: Bench
+        run: make bench
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: make && ./test_hekon.sh
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar czf "dist/hekon-${{ github.ref_name }}-linux-x86_64.tar.gz" hekon hekon.1 README.md
+      - name: Publish
+        run: gh release create "${{ github.ref_name }}" dist/*.tar.gz --title "${{ github.ref_name }}" --notes "Automated build."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
