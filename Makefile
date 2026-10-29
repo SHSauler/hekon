@@ -33,7 +33,10 @@ uninstall:
 test: hekon
 	./test_hekon.sh
 
+bench: hekon
+	./bench_hekon.sh
+
 clean:
 	rm -f hekon $(OBJS)
 
-.PHONY: all install uninstall test clean
+.PHONY: all install uninstall test bench clean

@@ -7,6 +7,7 @@
 hekon SOURCE TARGET        # dry-run: list what would be deleted, delete nothing
 hekon -d SOURCE TARGET     # actually delete the SOURCE duplicates
 hekon -q SOURCE TARGET     # hide progress indicator
+hekon -q --stats SOURCE TARGET  # + machine-parseable counters/timings on stderr
 hekon -h / -v              # help / version
 ```
 
@@ -33,7 +34,22 @@ Requires only a C compiler:
 make
 sudo make install        # PREFIX defaults to /usr/local
 make test                # build + run functional tests
+make bench               # synthetic benchmark (~64 MB default, BENCH_MB=10240 for ~10 GB)
 ```
+
+`--stats` prints one `stats:` line to stderr with exact counters, e.g.:
+
+```
+stats: files=811 partial_hashes=811 full_hashes=350 full_reused_small=360 \
+  bytes_partial=2297856 bytes_full=89260032 bytes_saved_small=552960 \
+  confirms=355 scan_ms=2 match_ms=139 total_ms=141 chunk_size=65536 partial_size=4096
+```
+
+`full_reused_small` / `bytes_saved_small` measure the small-file
+single-read win directly: files ≤ 4 KB whose full MD5 is copied from the
+partial digest instead of re-read. `bench_hekon.sh` asserts these are
+non-zero on its fixture, so `make bench` fails if the optimization
+regresses.
 
 ## Example
 

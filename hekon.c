@@ -48,13 +48,15 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <locale.h>
+
+#include "hekon.h"
 #ifdef HAVE_GETOPT_H
 #include <getopt.h>
 #endif
 
-#include "hekon.h"
 #include "file.h"
 #include "confirmmatch.h"
 #include "errormsg.h"
@@ -65,6 +67,24 @@ char *program_name;
 
 static int opt_delete = 0;
 static int opt_quiet = 0;
+static int opt_stats = 0;
+
+/* Measurable counters for Phase A (and later phases). All increments for
+   hashing happen on the paths that actually read file bytes, so
+   --stats proves the small-file single-read win (full_reused) instead of
+   asserting it. Timings are monotonic wall-clock milliseconds. */
+static struct {
+  long long partial_hashes;
+  long long full_hashes;
+  long long full_reused_small;
+  long long bytes_partial;
+  long long bytes_full;
+  long long bytes_saved_small;
+  long long confirms;
+  uint64_t scan_ms;
+  uint64_t match_ms;
+  uint64_t total_ms;
+} g_stats;
 
 typedef struct {
   file_t file;        /* must remain the first member so file_t* casts are valid */
@@ -243,6 +263,17 @@ md5_byte_t *getcrcsignatureuntil(char *filename, off_t fsize, off_t max_read)
     return NULL;
   }
 
+  /* Sequential readahead hint; best-effort, ignore failures and platforms
+     without posix_fadvise. fileno() needs stdio.h (already included). */
+  {
+    int fd = fileno(file);
+    if (fd != -1) {
+#ifdef POSIX_FADV_SEQUENTIAL
+      posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+    }
+  }
+
   while (fsize > 0) {
     if (got_sigint) {
       fclose(file);
@@ -268,12 +299,41 @@ md5_byte_t *getcrcsignatureuntil(char *filename, off_t fsize, off_t max_read)
 
 md5_byte_t *getcrcsignature(char *filename, off_t fsize)
 {
-  return getcrcsignatureuntil(filename, fsize, 0);
+  md5_byte_t *d = getcrcsignatureuntil(filename, fsize, 0);
+  if (d != NULL) {
+    g_stats.full_hashes++;
+    g_stats.bytes_full += (long long)fsize;
+  }
+  return d;
 }
 
 md5_byte_t *getcrcpartialsignature(char *filename, off_t fsize)
 {
-  return getcrcsignatureuntil(filename, fsize, PARTIAL_MD5_SIZE);
+  md5_byte_t *d = getcrcsignatureuntil(filename, fsize, PARTIAL_MD5_SIZE);
+  if (d != NULL) {
+    off_t used = fsize < PARTIAL_MD5_SIZE ? fsize : PARTIAL_MD5_SIZE;
+    g_stats.partial_hashes++;
+    g_stats.bytes_partial += (long long)used;
+  }
+  return d;
+}
+
+/* Small-file fast path (Phase A.3): files with size <= PARTIAL_MD5_SIZE
+   are read once. partial == full by definition, so copy the 16-byte
+   digest instead of re-reading the file. Returns 1 when reused. */
+int reuse_partial_as_full(file_t *file)
+{
+  if (file->size > PARTIAL_MD5_SIZE || file->crcpartial == NULL)
+    return 0;
+  file->crcsignature = (md5_byte_t*) malloc(MD5_DIGEST_LENGTH * sizeof(md5_byte_t));
+  if (file->crcsignature == NULL) {
+    errormsg("out of memory\n");
+    exit(1);
+  }
+  memcpy(file->crcsignature, file->crcpartial, MD5_DIGEST_LENGTH);
+  g_stats.full_reused_small++;
+  g_stats.bytes_saved_small += (long long)file->size;
+  return 1;
 }
 
 int md5cmp(const md5_byte_t *a, const md5_byte_t *b)
@@ -349,6 +409,7 @@ int confirmpair(file_t *a, file_t *b)
     return 0;
   }
 
+  g_stats.confirms++;
   r = confirmmatch(f1, f2); /* seeks to 0 internally */
 
   fclose(f1);
@@ -397,14 +458,18 @@ file_t **checkmatch(filetree_t *checktree, file_t *file)
 
     if (cmpresult == 0) {
       if (checktree->file->crcsignature == NULL) {
-        checktree->file->crcsignature = getcrcsignature(checktree->file->d_name, checktree->file->size);
-        if (checktree->file->crcsignature == NULL)
-          return NULL;
+        if (!reuse_partial_as_full(checktree->file)) {
+          checktree->file->crcsignature = getcrcsignature(checktree->file->d_name, checktree->file->size);
+          if (checktree->file->crcsignature == NULL)
+            return NULL;
+        }
       }
       if (file->crcsignature == NULL) {
-        file->crcsignature = getcrcsignature(file->d_name, file->size);
-        if (file->crcsignature == NULL)
-          return NULL;
+        if (!reuse_partial_as_full(file)) {
+          file->crcsignature = getcrcsignature(file->d_name, file->size);
+          if (file->crcsignature == NULL)
+            return NULL;
+        }
       }
 
       cmpresult = md5cmp(file->crcsignature, checktree->file->crcsignature);
@@ -463,6 +528,27 @@ int countsets(file_t *files)
     files = files->next;
   }
   return n;
+}
+
+/* Machine-parseable counters on stderr (KEY=VALUE per line, plus a human
+   line). Every value is exact, not sampled, so bench runs can assert on
+   them: e.g. full_reused_small == number of <=4KB files that reached the
+   full-hash stage, bytes_saved_small == bytes not re-read. */
+void print_stats(int filecount)
+{
+  fprintf(stderr, "stats: files=%d partial_hashes=%lld full_hashes=%lld "
+    "full_reused_small=%lld bytes_partial=%lld bytes_full=%lld "
+    "bytes_saved_small=%lld confirms=%lld "
+    "scan_ms=%llu match_ms=%llu total_ms=%llu chunk_size=%d partial_size=%d\n",
+    filecount,
+    g_stats.partial_hashes, g_stats.full_hashes,
+    g_stats.full_reused_small,
+    g_stats.bytes_partial, g_stats.bytes_full,
+    g_stats.bytes_saved_small, g_stats.confirms,
+    (unsigned long long)g_stats.scan_ms,
+    (unsigned long long)g_stats.match_ms,
+    (unsigned long long)g_stats.total_ms,
+    CHUNK_SIZE, PARTIAL_MD5_SIZE);
 }
 
 /* A chain member is deletable only if it lives in SOURCE. TARGET members
@@ -622,6 +708,7 @@ void help_text(void)
     "one copy is kept and the rest are treated as duplicates.\n\n"
     "  -d --delete   actually delete the SOURCE duplicates\n"
     "  -q --quiet    hide progress indicator\n"
+    "  --stats       print machine-parseable counters/timings to stderr\n"
     "  -v --version  display version\n"
     "  -h --help     display this help message\n\n"
     "Both directories are recursed. Symlinks are not followed.\n"
@@ -652,6 +739,7 @@ int main(int argc, char **argv)
   static struct option long_options[] = {
     { "delete",  0, 0, 'd' },
     { "quiet",   0, 0, 'q' },
+    { "stats",   0, 0, 1000 },
     { "version", 0, 0, 'v' },
     { "help",    0, 0, 'h' },
     { 0, 0, 0, 0 }
@@ -664,6 +752,22 @@ int main(int argc, char **argv)
   program_name = argv[0];
   setlocale(LC_CTYPE, "");
 
+  /* --stats must also work when built without getopt_long (HAVE_GETOPT_H
+     unset): pre-scan argv and strip it so plain getopt never sees it. */
+  {
+    int ai;
+    for (ai = 1; ai < argc; ai++) {
+      if (strcmp(argv[ai], "--stats") == 0) {
+        int aj;
+        opt_stats = 1;
+        for (aj = ai; aj < argc - 1; aj++)
+          argv[aj] = argv[aj + 1];
+        argc--;
+        ai--;
+      }
+    }
+  }
+
   while ((opt = GETOPT(argc, argv, "dqvh"
 #ifdef HAVE_GETOPT_H
           , long_options, NULL
@@ -675,6 +779,9 @@ int main(int argc, char **argv)
       break;
     case 'q':
       opt_quiet = 1;
+      break;
+    case 1000:
+      opt_stats = 1;
       break;
     case 'v':
       printf("hekon %s\n", HEKON_VERSION);
@@ -737,17 +844,23 @@ int main(int argc, char **argv)
 
   register_sigint_handler();
 
+  {
+    uint64_t t_total_start = now64();
+    uint64_t t_scan_start = now64();
   /* scan SOURCE first, then TARGET last. The file list is built by
      prepending, so scanning TARGET last puts TARGET files at the head of
      the list; the matching loop then registers TARGET files first, making
      them the set heads (protected) wherever a set contains a TARGET copy. */
   filecount += scan_directory(sourcedir, &files, 0);
   filecount += scan_directory(targetdir, &files, 1);
+  g_stats.scan_ms = now64() - t_scan_start;
 
   if (!opt_quiet)
     fprintf(stderr, "\r%-40s\r", " ");
 
   /* match: build duplicate chains */
+  {
+    uint64_t t_match_start = now64();
   curfile = files;
   while (curfile) {
     if (got_sigint) {
@@ -778,6 +891,8 @@ int main(int argc, char **argv)
       progress++;
     }
   }
+    g_stats.match_ms = now64() - t_match_start;
+  }
 
   if (!opt_quiet)
     fprintf(stderr, "\r%-40s\r", " ");
@@ -786,6 +901,12 @@ int main(int argc, char **argv)
     delete_candidates(files);
   else
     print_dryrun(files);
+
+  g_stats.total_ms = now64() - t_total_start;
+  if (opt_stats) {
+    fflush(stdout);
+    print_stats(filecount);
+  }
 
   /* cleanup */
   while (files) {
@@ -797,6 +918,7 @@ int main(int argc, char **argv)
     files = curfile;
   }
   purgetree(checktree);
+  }
 
   return 0;
 }

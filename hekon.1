@@ -43,6 +43,16 @@ is a dry run.
 .BR \-q ", " \-\-quiet
 Hide the progress indicator.
 .TP
+.B \-\-stats
+Print a machine-parseable
+.B stats:
+line to stderr with exact counters (files, partial/full hashes,
+full_reused_small, bytes_partial/full/saved, confirms) and wall-clock
+timings (scan_ms, match_ms, total_ms), plus the active chunk_size and
+partial_size. Used by
+.B bench_hekon.sh
+to verify optimizations.
+.TP
 .BR \-v ", " \-\-version
 Display version.
 .TP

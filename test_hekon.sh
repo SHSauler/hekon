@@ -94,5 +94,27 @@ pass "idempotent: second run clean"
 "$HEKON" -q "$SRC" >/dev/null 2>&1 && fail "single arg accepted" || pass "arg count validated"
 "$HEKON" -q "$SRC/nonexistent" "$TGT" >/dev/null 2>&1 && fail "bad dir accepted" || pass "bad dir rejected"
 
+# --- --stats is machine-parseable and proves the Phase A wins ---
+# (fresh fixture: the main one was already deduplicated above)
+SSTAT="$ROOT/stats-src"; TSTAT="$ROOT/stats-tgt"
+mkdir -p "$SSTAT" "$TSTAT"
+printf 'photo-content-123' > "$TSTAT/keep.jpg"
+cp "$TSTAT/keep.jpg" "$SSTAT/a.jpg"
+printf 'x' > "$TSTAT/tiny"
+cp "$TSTAT/tiny" "$SSTAT/tiny-copy"
+STAT_OUT="$("$HEKON" -q --stats "$SSTAT" "$TSTAT" 2>&1)"
+echo "$STAT_OUT" | grep -q "^stats:" || fail "--stats line missing"
+echo "$STAT_OUT" | grep -q "chunk_size=65536" || fail "--stats chunk_size != 65536"
+# all fixture files are <=4KB: any dupe comparison reaching the full-hash
+# stage must reuse the partial digest instead of re-reading the file
+echo "$STAT_OUT" | grep -q "full_reused_small=[1-9]" || fail "--stats full_reused_small==0 (single-read path dead)"
+echo "$STAT_OUT" | grep -q "bytes_saved_small=[1-9]" || fail "--stats bytes_saved_small==0"
+echo "$STAT_OUT" | grep -q "partial_hashes=[1-9]" || fail "--stats partial_hashes==0"
+pass "--stats counters present and single-read reuse observed"
+
+# --- long options work ---
+"$HEKON" --quiet "$SRC" "$TGT" >/dev/null 2>&1 || fail "--quiet long option broken"
+pass "long options accepted"
+
 if [ "$FAIL" -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; fi
 exit "$FAIL"

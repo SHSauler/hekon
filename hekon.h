@@ -13,7 +13,7 @@
 #endif
 
 /* number of bytes to read per read call */
-#define CHUNK_SIZE 8192
+#define CHUNK_SIZE 65536
 
 /* max bytes used when calculating partial hashes */
 #define PARTIAL_MD5_SIZE 4096
@@ -23,6 +23,12 @@
 
 /* stat supports nanosecond precision (Linux) */
 #define HAVE_NSEC_TIMES 1
+
+/* getopt_long lives in getopt.h on glibc/musl/macOS; enable long options
+   by default. Builds on exotic platforms can compile with -UHAVE_GETOPT_H. */
+#ifndef HAVE_GETOPT_H
+#define HAVE_GETOPT_H 1
+#endif
 
 #define HEKON_VERSION "1.0.0"
 
